@@ -1,0 +1,18 @@
+name = "observability-tail"
+main = "src/index.ts"
+compatibility_date = "2026-04-25"
+
+# Tail Worker として動作: 別 Worker (shirankedo / swipe-persona-api / worldpulse-api) の
+# tail event を受け取り、level=error をフィルタして Discord に通知。
+# 通知元 Worker 側で `tail_consumers = [{ service = "observability-tail" }]` を指定することで
+# この worker にイベントが流れる。
+
+# ノイズ抑制用 KV: 同一エラーメッセージの hash を TTL=60s で保持し、重複通知を防ぐ
+# `wrangler kv namespace create observability-tail-dedup` で作成し、ID をここに置き換える
+[[kv_namespaces]]
+binding = "DEDUP_KV"
+id = "PLACEHOLDER_KV_ID"
+
+# Workers Logs Dashboard でこの Worker 自身のログを観測（メタ）
+[observability]
+enabled = true
