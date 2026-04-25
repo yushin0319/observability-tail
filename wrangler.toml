@@ -11,7 +11,7 @@ compatibility_date = "2026-04-25"
 # `wrangler kv namespace create observability-tail-dedup` で作成し、ID をここに置き換える
 [[kv_namespaces]]
 binding = "DEDUP_KV"
-id = "PLACEHOLDER_KV_ID"
+id = "dbdc4e6dc46b440785f1f5bc6b806adc"
 
 # Workers Logs Dashboard でこの Worker 自身のログを観測（メタ）
 [observability]
