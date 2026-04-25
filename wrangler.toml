@@ -13,6 +13,11 @@ compatibility_date = "2026-04-25"
 binding = "DEDUP_KV"
 id = "dbdc4e6dc46b440785f1f5bc6b806adc"
 
+# A5: Worker エラー履歴を 7 日 TTL で保存して AI が GET /errors で query できる
+[[kv_namespaces]]
+binding = "ERROR_LOG_KV"
+id = "b4dec24c7d1b47a8b7028597574e73ab"
+
 # Workers Logs Dashboard でこの Worker 自身のログを観測（メタ）
 [observability]
 enabled = true
