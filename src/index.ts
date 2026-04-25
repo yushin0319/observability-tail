@@ -230,18 +230,37 @@ async function handleGetErrors(
   );
   const scriptFilter = url.searchParams.get("script");
 
-  // KV list (prefix=error:) で全件取り、cutoff 以降のものだけ返す
-  // 件数が多い場合に list を pagination するが、7 日 7000 件程度想定なので 1 page で足りる
-  const list = await env.ERROR_LOG_KV.list({ prefix: "error:", limit: 1000 });
+  // KV list (prefix=error:) を cursor で全 page 走査。エラー件数 1000 超に対応。
+  // key 形式 "error:{ts_padded}" は ASCII 順 = 時系列昇順なので、
+  // 先に key 一覧を集めて cutoff 以降だけ get する。
+  const matchedKeys: string[] = [];
+  let cursor: string | undefined;
+  // safety guard: 万一 KV にゴミが大量に入っても暴走しないよう page 数で打ち切り
+  for (let page = 0; page < 50; page++) {
+    const list = await env.ERROR_LOG_KV.list({
+      prefix: "error:",
+      limit: 1000,
+      cursor,
+    });
+    for (const k of list.keys) {
+      const parts = k.name.split(":");
+      if (parts.length < 2) continue;
+      const ts = Number(parts[1]);
+      if (Number.isNaN(ts) || ts < cutoff) continue;
+      matchedKeys.push(k.name);
+    }
+    if (list.list_complete) break;
+    cursor = list.cursor;
+    if (!cursor) break;
+  }
 
+  // matched keys だけ get (limit より多くは get しない、無駄な KV read を避ける)
   const items: StoredError[] = [];
-  for (const k of list.keys) {
-    // key 形式: error:{ts_padded}:{hash}
-    const parts = k.name.split(":");
-    if (parts.length < 2) continue;
-    const ts = Number(parts[1]);
-    if (Number.isNaN(ts) || ts < cutoff) continue;
-    const value = await env.ERROR_LOG_KV.get(k.name);
+  // 新しい順に処理して limit に達したら止める
+  matchedKeys.sort((a, b) => b.localeCompare(a));
+  for (const name of matchedKeys) {
+    if (items.length >= limit) break;
+    const value = await env.ERROR_LOG_KV.get(name);
     if (!value) continue;
     try {
       const parsed = JSON.parse(value) as StoredError;
@@ -251,15 +270,16 @@ async function handleGetErrors(
       // skip
     }
   }
-  // 最新が先頭
-  items.sort((a, b) => b.ts - a.ts);
+  // matchedKeys は ASCII 降順 = ts 降順なので items も既に降順
+  // ただし script フィルタで間引かれるので最終的な件数は limit 以下になることがある
 
   return Response.json({
     since_ms: sinceMs,
     cutoff_iso: new Date(cutoff).toISOString(),
-    count: Math.min(items.length, limit),
-    truncated: items.length > limit,
-    items: items.slice(0, limit),
+    count: items.length,
+    matched_keys: matchedKeys.length,
+    truncated: matchedKeys.length > items.length,
+    items,
   });
 }
 
