@@ -18,9 +18,18 @@
 interface Env {
   DEDUP_KV: KVNamespace;
   ERROR_LOG_KV: KVNamespace;
-  DISCORD_WEBHOOK_URL: string;
+  /** n8n の api/obs-notify エンドポイント (https://yushin-n8n.duckdns.org/webhook/obs-notify) */
+  OBS_NOTIFY_URL: string;
   READ_TOKEN?: string;
 }
+
+/** scriptName (= Worker name) → repo 名のマッピング */
+const SCRIPT_TO_REPO: Record<string, string> = {
+  shirankedo: "shirankedo",
+  "worldpulse-api": "WorldPulse",
+  "swipe-persona-api": "swipe-persona",
+  "observability-tail": "observability-tail",
+};
 
 interface TailLog {
   message: unknown[];
@@ -161,7 +170,7 @@ async function maybeNotify(
   event: TailEvent,
   item: ErrorItem,
 ): Promise<void> {
-  if (!env.DISCORD_WEBHOOK_URL) return;
+  if (!env.OBS_NOTIFY_URL) return;
 
   const truncated = item.message.slice(0, MESSAGE_TRUNCATE);
   const hash = await sha256(truncated);
@@ -175,24 +184,32 @@ async function maybeNotify(
 
   await env.DEDUP_KV.put(dedupKey, "1", { expirationTtl: DEDUP_TTL_SEC });
 
-  const embed = {
-    title: `⚠ ${event.scriptName ?? "unknown"} ${item.kind}`,
-    description: "```\n" + item.message.slice(0, 1500) + "\n```",
-    color: 0xe74c3c,
-    timestamp: new Date(event.eventTimestamp).toISOString(),
-    footer: { text: `outcome: ${event.outcome}` },
+  const scriptName = event.scriptName ?? "unknown";
+  const repo = SCRIPT_TO_REPO[scriptName];
+  const payload = {
+    severity: "warning" as const,
+    service: "cf-worker",
+    subject: `⚠ ${scriptName} ${item.kind}`,
+    summary: item.message.slice(0, 1500),
+    ...(repo ? { repo } : {}),
+    raw_payload: {
+      scriptName,
+      outcome: event.outcome,
+      kind: item.kind,
+      message: item.message.slice(0, 1500),
+    },
   };
 
   try {
-    const resp = await fetch(env.DISCORD_WEBHOOK_URL, {
+    const resp = await fetch(env.OBS_NOTIFY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ embeds: [embed] }),
+      body: JSON.stringify(payload),
     });
     if (!resp.ok) {
       console.log(
         JSON.stringify({
-          type: "discord_error",
+          type: "obs_notify_error",
           status: resp.status,
         }),
       );
@@ -200,7 +217,7 @@ async function maybeNotify(
   } catch (e) {
     console.log(
       JSON.stringify({
-        type: "discord_exception",
+        type: "obs_notify_exception",
         error: e instanceof Error ? e.message : String(e),
       }),
     );

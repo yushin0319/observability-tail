@@ -70,14 +70,14 @@ function makeEnv(overrides: Record<string, unknown> = {}) {
   return {
     DEDUP_KV: makeKV() as unknown as KVNamespace,
     ERROR_LOG_KV: makeKV() as unknown as KVNamespace,
-    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/x/y",
+    OBS_NOTIFY_URL: "https://yushin-n8n.duckdns.org/webhook/obs-notify",
     READ_TOKEN: "test-token-123",
     ...overrides,
   };
 }
 
 describe("observability-tail Worker tail handler", () => {
-  it("level=error のログ 1 件で Discord に POST + KV 永続化する", async () => {
+  it("level=error のログ 1 件で obs-notify に POST + KV 永続化する", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
         new Response("", { status: 204 }),
@@ -111,7 +111,7 @@ describe("observability-tail Worker tail handler", () => {
     expect(entry.ttl).toBe(7 * 24 * 3600);
   });
 
-  it("info ログは Discord も KV 永続化もしない", async () => {
+  it("info ログは obs-notify も KV 永続化もしない", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
         new Response("", { status: 204 }),
@@ -136,7 +136,7 @@ describe("observability-tail Worker tail handler", () => {
     ).toBe(0);
   });
 
-  it("60秒以内の同一メッセージは Discord skip だが KV には毎回保存", async () => {
+  it("60秒以内の同一メッセージは obs-notify skip だが KV には毎回保存", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
         new Response("", { status: 204 }),
@@ -160,7 +160,7 @@ describe("observability-tail Worker tail handler", () => {
     );
     await Promise.all(ctx2.promises);
 
-    // Discord は 1 回（dedup）
+    // obs-notify は 1 回（dedup）
     expect(fetchMock).toHaveBeenCalledTimes(1);
     // KV は 2 件（dedup なし、すべての error を履歴として残す）
     expect(
@@ -168,7 +168,7 @@ describe("observability-tail Worker tail handler", () => {
     ).toBe(2);
   });
 
-  it("exception 1 件でも Discord に POST + KV 永続化", async () => {
+  it("exception 1 件でも obs-notify に POST + KV 永続化", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
         new Response("", { status: 204 }),
