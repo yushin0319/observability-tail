@@ -3,14 +3,15 @@
  *
  * 別 Worker (shirankedo / swipe-persona-api / worldpulse-api) の tail event を
  * 受信し:
- * 1. level=error / exception を Discord に通知（M11）
+ * 1. level=error / exception を n8n obs-notify (#529) 経由で通知（severity=warning）
+ *    → 振り分け先 Discord channel + Notion 観測性ログ DB は obs-notify WF が担当
  * 2. ERROR_LOG_KV に 7 日 TTL で保存し、GET /errors で AI が query 可能（A5）
  *
  * - 通知元 Worker 側の wrangler 設定に `[[tail_consumers]]` を追加すると、
  *   その Worker のリクエストごとに `tail` ハンドラへ TraceItem が流れてくる。
- * - Discord webhook は env.DISCORD_WEBHOOK_URL（wrangler secret）で渡す。
+ * - n8n の観測性統一エンドポイントは env.OBS_NOTIFY_URL（wrangler secret）で渡す。
  * - 重複通知を避けるため、エラーメッセージ先頭 200 文字の hash を 60 秒 TTL の
- *   DEDUP_KV に書き込み、KV ヒット中は Discord 通知をスキップ。
+ *   DEDUP_KV に書き込み、KV ヒット中は obs-notify への POST をスキップ。
  * - GET /errors?since=1h は ERROR_LOG_KV から該当期間の error を返す。
  *   READ_TOKEN（wrangler secret）の Bearer auth 必須。
  */
