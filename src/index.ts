@@ -102,10 +102,15 @@ function collectErrors(event: TailEvent): ErrorItem[] {
   const items: ErrorItem[] = [];
 
   for (const log of event.logs) {
-    if (log.level !== "error") continue;
+    const message = stringifyMessage(log.message);
+    // level=error は当然拾うが、shirankedo の logCronError 等が
+    // console.log(JSON.stringify({type:"cron_failed",...})) で吐く JSON も
+    // 取りこぼさないため type:"cron_failed" を含むログは error 扱いにする
+    const isError = log.level === "error" || isCronFailedLog(message);
+    if (!isError) continue;
     items.push({
       kind: "log",
-      message: stringifyMessage(log.message),
+      message,
     });
   }
 
@@ -117,6 +122,12 @@ function collectErrors(event: TailEvent): ErrorItem[] {
   }
 
   return items;
+}
+
+const CRON_FAILED_RE = /"type"\s*:\s*"cron_failed"/;
+
+function isCronFailedLog(message: string): boolean {
+  return CRON_FAILED_RE.test(message);
 }
 
 function stringifyMessage(parts: unknown[]): string {
