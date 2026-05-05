@@ -168,6 +168,79 @@ describe("observability-tail Worker tail handler", () => {
     ).toBe(2);
   });
 
+  it("level=log でも message に type:cron_failed が含まれていれば拾う", async () => {
+    // shirankedo の logCronError が console.log(JSON.stringify({type:"cron_failed",...}))
+    // で吐く JSON を取りこぼさない（観測性プロジェクト 2026-05-04 の事故の本筋）
+    const fetchMock = vi.fn(
+      async (_url: string, _init: RequestInit) =>
+        new Response("", { status: 204 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const env = makeEnv();
+    const cronFailedJson = JSON.stringify({
+      type: "cron_failed",
+      cron: "daily-releases",
+      error: "self-fetch returned 404",
+    });
+    const events = [
+      makeEvent({
+        logs: [
+          { message: [cronFailedJson], level: "log", timestamp: Date.now() },
+        ],
+      }),
+    ];
+    const ctx = makeCtx();
+    await worker.tail!(
+      events as unknown as Parameters<NonNullable<typeof worker.tail>>[0],
+      env,
+      ctx,
+    );
+    await Promise.all(ctx.promises);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const erroLogStore = (env.ERROR_LOG_KV as unknown as MockKV).store;
+    expect(erroLogStore.size).toBe(1);
+    const [, entry] = Array.from(erroLogStore)[0];
+    const stored = JSON.parse(entry.value);
+    expect(stored.message).toContain("cron_failed");
+    expect(stored.message).toContain("daily-releases");
+    expect(stored.kind).toBe("log");
+  });
+
+  it("level=log で cron_failed を含まない通常ログは拾わない", async () => {
+    // 偽陽性チェック: 普通の構造化ログ (type:cron_started 等) で発火しないこと
+    const fetchMock = vi.fn(
+      async (_url: string, _init: RequestInit) =>
+        new Response("", { status: 204 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const env = makeEnv();
+    const ordinaryJson = JSON.stringify({
+      type: "cron_started",
+      cron: "daily-releases",
+    });
+    const events = [
+      makeEvent({
+        logs: [
+          { message: [ordinaryJson], level: "log", timestamp: Date.now() },
+          { message: ["plain log"], level: "log", timestamp: Date.now() },
+        ],
+      }),
+    ];
+    const ctx = makeCtx();
+    await worker.tail!(
+      events as unknown as Parameters<NonNullable<typeof worker.tail>>[0],
+      env,
+      ctx,
+    );
+    await Promise.all(ctx.promises);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(
+      (env.ERROR_LOG_KV as unknown as MockKV).store.size,
+    ).toBe(0);
+  });
+
   it("exception 1 件でも obs-notify に POST + KV 永続化", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
