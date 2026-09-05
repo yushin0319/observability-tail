@@ -1,6 +1,6 @@
 # observability-tail
 
-Cloudflare Workers Tail Worker。upstream Workers（shirankedo / swipe-persona-api / worldpulse-api）の `level=error` / 例外を **n8n の `api/obs-notify` 経由で Discord 通知 + Notion 観測性ログ DB に並行記録** し、AI が後追い query できるよう 7 日間の error 履歴を KV にも保存する。
+Cloudflare Workers Tail Worker。upstream Workers（shirankedo / swipe-persona-api / worldpulse-api）の `level=error` / 例外 / **`type:"cron_failed"` を含む `level=log`** を **n8n の `api/obs-notify` 経由で Discord 通知 + Notion 観測性ログ DB に並行記録** し、AI が後追い query できるよう 7 日間の error 履歴を KV にも保存する。
 
 ## 仕組み
 
@@ -10,6 +10,7 @@ shirankedo / worldpulse-api / swipe-persona-api
    ▼
 observability-tail (この Worker)
    │  level=error / exception を抽出
+   │  + level=log でも `"type":"cron_failed"` を含むものは error 扱い
    │  DEDUP_KV (TTL 60s) で重複抑制
    │  ERROR_LOG_KV (TTL 7d) に履歴保存
    ▼
@@ -17,6 +18,16 @@ observability-tail (この Worker)
    │       └──> #obs-warning channel + Notion 観測性ログ DB
    └──> GET /errors?since=1h&script=worldpulse-api  (Bearer 認証で AI が pull)
 ```
+
+## error として拾う条件
+
+| 種別 | 条件 |
+|---|---|
+| ログ | `level === "error"` |
+| ログ | `level` を問わず本文に `"type":"cron_failed"` を含む（正規表現 `CRON_FAILED_RE`） |
+| 例外 | `event.exceptions` に入っているもの全件 |
+
+2 番目は shirankedo の `logCronError` が `console.log(JSON.stringify({type:"cron_failed", ...}))` で吐くため、`level=log` に埋もれた cron 失敗を取りこぼさないためのもの。scheduled handler が `outcome=success` のまま失敗を握りつぶす罠への対策として入っている。
 
 ## エンドポイント
 
