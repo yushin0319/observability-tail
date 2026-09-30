@@ -69,6 +69,20 @@ service = "observability-tail"
 "tail_consumers": [{ "service": "observability-tail" }]
 ```
 
+## 開発・デプロイ
+
+- TypeScript（`src/index.ts`）/ vitest（`src/index.test.ts`）/ wrangler。パッケージマネージャは Bun（`bun.lock`）
+
+```bash
+bun install
+bun run test         # vitest run
+bun run typecheck    # tsc --noEmit
+```
+
+- CI（`.github/workflows/ci.yml`）: typecheck + vitest
+- デプロイ（`.github/workflows/deploy.yml`）: main で CI が成功すると `bunx wrangler deploy` が自動で走る。上の手動 `bunx wrangler deploy` は初回セットアップ・緊急時用
+- PR レビュー: `.github/workflows/gemini-review.yml`
+
 ## 動作確認
 
 上流 Worker でわざと例外を投げる → 数秒〜十数秒で `#obs-warning` channel に通知 + Notion 観測性ログ DB に row 追加。60 秒以内の重複は 1 通のみ。後追い確認:
