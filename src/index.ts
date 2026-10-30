@@ -126,13 +126,8 @@ interface TailError {
   message: string;
 }
 
-interface StoredError {
-  ts: number;
-  scriptName: string | null;
-  outcome: string;
-  kind: "log" | "exception";
-  message: string;
-}
+/** ERROR_LOG_KV に保存する形 (message は 4000 文字まで) */
+type StoredError = TailError;
 
 function collectErrors(event: TailEvent): ErrorItem[] {
   const items: ErrorItem[] = [];
