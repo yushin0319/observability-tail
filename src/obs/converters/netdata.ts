@@ -3,7 +3,7 @@
  * n8n-server の code-nodes/api-obs-from-netdata/ConvertNetdata.ts を純関数にしたもの。
  */
 import type { ObsNotifyPayload } from "../obsNotifyPayload";
-import { HOST_TO_REPO as BASE_HOST_TO_REPO, HTTP_URL } from "../shared";
+import { HOST_TO_REPO as BASE_HOST_TO_REPO, HTTP_URL, lookup } from "../shared";
 import type { JsonObject } from "../types";
 
 const STATUS_TO_SEVERITY: Record<string, "critical" | "warning" | "info"> = {
@@ -66,7 +66,7 @@ export function convertNetdata(input: unknown): ObsNotifyPayload[] {
     return [out];
   }
 
-  const severity = STATUS_TO_SEVERITY[status] ?? "warning";
+  const severity = lookup(STATUS_TO_SEVERITY, status) ?? "warning";
   const emoji =
     severity === "critical" ? "🚨" : severity === "info" ? "✅" : "⚠";
 
@@ -89,7 +89,7 @@ export function convertNetdata(input: unknown): ObsNotifyPayload[] {
     raw_payload: body,
   };
   if (HTTP_URL.test(rawUrl)) out.url = rawUrl;
-  const repo = HOST_TO_REPO[host];
+  const repo = lookup(HOST_TO_REPO, host);
   if (repo) out.repo = repo;
   return [out];
 }

@@ -3,6 +3,7 @@
  * n8n-server の code-nodes/api-obs-from-sentry/ConvertSentry.ts を純関数にしたもの。
  */
 import type { ObsNotifyPayload } from "../obsNotifyPayload";
+import { lookup } from "../shared";
 import type { JsonObject } from "../types";
 
 /** Sentry project slug → repo 名のマッピング */
@@ -61,7 +62,7 @@ export function convertSentry(input: unknown): ObsNotifyPayload[] {
     (event.project_slug as string) ||
     (errorObj.project_slug as string) ||
     "";
-  const repo = PROJECT_TO_REPO[projectSlug];
+  const repo = lookup(PROJECT_TO_REPO, projectSlug);
 
   if (!title) {
     // 想定外の Sentry payload 形式: throw せず warning で受け流して人間が判別できる
@@ -84,7 +85,7 @@ export function convertSentry(input: unknown): ObsNotifyPayload[] {
     return [out];
   }
 
-  const baseSeverity = LEVEL_TO_SEVERITY[level] ?? "warning";
+  const baseSeverity = lookup(LEVEL_TO_SEVERITY, level) ?? "warning";
   // 慢性ベースライン: 1GB OCI Micro の EventLoopBlocked は体力不足由来の非アクショナブル
   // 症状 (恒久策は A1-flex 移行 = Notion task #477)。#obs-warning の ping を止めるため
   // info に格下げする。観測性 DB (Notion) に記録は残るので追跡は可能。

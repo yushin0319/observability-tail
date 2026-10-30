@@ -3,7 +3,7 @@
  * n8n-server の code-nodes/api-obs-from-grafana/ConvertGrafana.ts を純関数にしたもの。
  */
 import type { ObsNotifyPayload } from "../obsNotifyPayload";
-import { HOST_TO_REPO, HTTP_URL } from "../shared";
+import { HOST_TO_REPO, HTTP_URL, lookup } from "../shared";
 import type { JsonObject } from "../types";
 
 const LABEL_TO_SEVERITY: Record<string, "critical" | "warning" | "info"> = {
@@ -36,7 +36,7 @@ function convertOne(alert: Alert, rootStatus: string): ObsNotifyPayload {
   if (status === "resolved") {
     severity = "info";
   } else {
-    severity = LABEL_TO_SEVERITY[sevLabel] ?? "warning";
+    severity = lookup(LABEL_TO_SEVERITY, sevLabel) ?? "warning";
   }
 
   const emoji =
@@ -71,7 +71,7 @@ function convertOne(alert: Alert, rootStatus: string): ObsNotifyPayload {
   if (alert.generatorURL && HTTP_URL.test(alert.generatorURL)) {
     out.url = alert.generatorURL;
   }
-  const repo = HOST_TO_REPO[host];
+  const repo = lookup(HOST_TO_REPO, host);
   if (repo) out.repo = repo;
   return out;
 }

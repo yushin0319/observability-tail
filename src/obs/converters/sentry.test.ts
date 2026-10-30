@@ -102,4 +102,15 @@ describe("convertSentry", () => {
     expect(out.subject).toContain("EventLoopBlocked");
     expect(out.repo).toBe("n8n-server");
   });
+
+  it.each(["constructor", "__proto__", "toString"])(
+    "level・project slug %s は対応表の組み込みのキーに当たらない",
+    (key) => {
+      const [out] = convertSentry({
+        data: { issue: { title: "x", level: key, project: { slug: key } } },
+      });
+      expect(out.severity).toBe("warning");
+      expect(out.repo).toBeUndefined();
+    },
+  );
 });

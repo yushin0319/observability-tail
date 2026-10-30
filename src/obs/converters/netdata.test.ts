@@ -79,4 +79,12 @@ describe("convertNetdata", () => {
     expect(out.subject).toContain("20min_steal_cpu");
     expect(out.repo).toBe("crypto-ai-trader");
   });
+
+  it.each(["constructor", "__proto__", "toString"])(
+    "host %s は対応表の組み込みのキーに当たらない (repo なし)",
+    (key) => {
+      const [out] = convertNetdata({ alarm: "x", alarm_status: "WARNING", host: key });
+      expect(out.repo).toBeUndefined();
+    },
+  );
 });

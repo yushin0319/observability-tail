@@ -221,13 +221,11 @@ async function reject(
 
 /**
  * 本文を上限付きで読む。上限を超えたら null。
- * Content-Length があればそれで判断し、無ければストリームで読みながら数える。
+ * Content-Length が上限超えなら読まずに返す。宣言は偽れるので、本文は常に読みながら数える。
  */
 async function readLimitedText(request: Request): Promise<string | null> {
   const declared = Number(request.headers.get("Content-Length") ?? Number.NaN);
-  if (Number.isFinite(declared)) {
-    return declared > MAX_BODY_BYTES ? null : request.text();
-  }
+  if (Number.isInteger(declared) && declared > MAX_BODY_BYTES) return null;
   if (!request.body) return "";
 
   const reader = request.body.getReader();

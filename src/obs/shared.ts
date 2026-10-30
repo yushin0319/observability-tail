@@ -15,6 +15,14 @@ export const HOST_TO_REPO: Readonly<Record<string, string>> = {
   "crypto-ai-trader-runner": "crypto-ai-trader",
 };
 
+/**
+ * 対応表を外部から来た値で引く。"constructor" や "__proto__" で Object の組み込みに当たらないよう、
+ * 表に直接書いたキーだけを返す。
+ */
+export function lookup<V>(table: Readonly<Record<string, V>>, key: string): V | undefined {
+  return Object.hasOwn(table, key) ? table[key] : undefined;
+}
+
 /** SHA-256 の先頭 bytes バイトを 16 進文字列で返す (KV のキー長を変えないよう呼び出し側で長さを決める) */
 export async function sha256Hex(s: string, bytes = 32): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));

@@ -227,6 +227,21 @@ describe("本文の大きさ (256,000 バイトまで)", () => {
     expect(pulled).toBeLessThan(10);
   });
 
+  it.each(["", "-1", "abc"])(
+    "Content-Length が不正な値 (%j) でも読みながら数え、上限超えは 413",
+    async (declared) => {
+      stubFetch();
+      const body = JSON.stringify({ ...validNotify, summary: "x".repeat(MAX_BODY_BYTES) });
+      const r = await call(
+        post("/obs-notify", body, {
+          "X-Webhook-Secret": WEBHOOK_SECRET,
+          "Content-Length": declared,
+        }),
+      );
+      expect(r.status).toBe(413);
+    },
+  );
+
   it("上限ちょうどまでは受け付ける", async () => {
     const { notionCalls } = stubFetch();
     // subject の「⚠」は 3 バイトなので文字数ではなくバイト数で埋める
@@ -236,7 +251,7 @@ describe("本文の大きさ (256,000 バイトまで)", () => {
     const padding = "x".repeat(MAX_BODY_BYTES - baseBytes);
     const body = JSON.stringify({ ...validNotify, summary: padding });
     expect(new TextEncoder().encode(body).byteLength).toBe(MAX_BODY_BYTES);
-    // Content-Length なし (ストリームで数える) と、あり (そのまま読む) の両方
+    // Content-Length なしとありの両方
     const r1 = await call(post("/obs-notify", body, { "X-Webhook-Secret": WEBHOOK_SECRET }));
     const r2 = await call(
       post("/obs-notify", body, {

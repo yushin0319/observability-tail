@@ -131,4 +131,16 @@ describe("convertGrafana", () => {
     expect(out.severity).toBe("warning");
     expect(out.subject).toContain("Grafana unknown payload");
   });
+
+  it.each(["constructor", "__proto__", "toString"])(
+    "ラベルの値 %s は対応表の組み込みのキーに当たらない (repo なし・severity は既定の warning)",
+    (key) => {
+      const [out] = convertGrafana({
+        status: "firing",
+        alerts: [{ status: "firing", labels: { alertname: "x", host: key, severity: key } }],
+      });
+      expect(out.severity).toBe("warning");
+      expect(out.repo).toBeUndefined();
+    },
+  );
 });
