@@ -1,26 +1,35 @@
 /**
- * Cloudflare Tail Worker (M11) + Error History API (A5).
+ * Cloudflare Tail Worker (M11) + Error History API (A5) + 観測性イベント受付 (obs-notify).
  *
  * 別 Worker (shirankedo / swipe-persona-api / worldpulse-api) の tail event を
  * 受信し:
- * 1. level=error / exception を n8n obs-notify (#529) 経由で通知（severity=warning）
- *    → 振り分け先 Discord channel + Notion 観測性ログ DB は obs-notify WF が担当
+ * 1. level=error / exception を観測性イベント (severity=warning) として処理する
+ *    → src/obs/process.ts が Notion 観測性ログ DB に書き込む (HTTP を経由せず直接呼ぶ)
  * 2. ERROR_LOG_KV に 7 日 TTL で保存し、GET /errors で AI が query 可能（A5）
  *
  * - 通知元 Worker 側の wrangler 設定に `[[tail_consumers]]` を追加すると、
  *   その Worker のリクエストごとに `tail` ハンドラへ TraceItem が流れてくる。
- * - n8n の観測性統一エンドポイントは env.OBS_NOTIFY_URL（wrangler secret）で渡す。
  * - 重複通知を避けるため、エラーメッセージ先頭 200 文字の hash を 60 秒 TTL の
- *   DEDUP_KV に書き込み、KV ヒット中は obs-notify への POST をスキップ。
+ *   DEDUP_KV に書き込み、KV ヒット中は記録をスキップ。
+ * - 1 回の tail 呼び出しで拾ったエラーはまとめて 1 回の processPayloads に渡す
+ *   (直接書けない分は 1 回の sendBatch で再送キューへ)。
  * - GET /errors?since=1h は ERROR_LOG_KV から該当期間の error を返す。
  *   READ_TOKEN（wrangler secret）の Bearer auth 必須。
+ * - POST /obs-notify・POST /obs-from/{sentry|healthchecks|grafana|netdata} で外部からの
+ *   観測性イベントを受け付ける (src/obs/routes.ts)。Notion に書けなかった分は
+ *   OBS_RETRY_QUEUE に積み、queue ハンドラが後から書き込む。
  */
+import { matchesSecret } from "./obs/auth";
+import { InvocationBudget } from "./obs/budget";
+import type { ObsNotifyPayload } from "./obs/obsNotifyPayload";
+import { consumeRetryBatch, processPayloads } from "./obs/process";
+import { routeObsRequest } from "./obs/routes";
+import { claimOnce, errorMessage, sha256Hex } from "./obs/shared";
+import type { ObsEnv } from "./obs/types";
 
-interface Env {
+interface Env extends ObsEnv {
   DEDUP_KV: KVNamespace;
   ERROR_LOG_KV: KVNamespace;
-  /** n8n の api/obs-notify エンドポイント (https://yushin-n8n.duckdns.org/webhook/obs-notify) */
-  OBS_NOTIFY_URL: string;
   READ_TOKEN?: string;
 }
 
@@ -52,9 +61,10 @@ interface TailEvent {
   eventTimestamp: number;
 }
 
-const DEDUP_TTL_SEC = 60;
 const ERROR_LOG_TTL_SEC = 7 * 24 * 3600; // 7 日
 const MESSAGE_TRUNCATE = 200;
+/** KV のキーに使う hash の長さ (バイト)。既存のキーと揃える */
+const MESSAGE_HASH_BYTES = 8;
 
 export default {
   async tail(
@@ -62,18 +72,28 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
+    // waitUntil にはイベント全体ではなく、拾ったエラーの必要な項目だけを渡す
+    const errors: TailError[] = [];
     for (const event of events) {
-      const errorItems = collectErrors(event);
-      if (errorItems.length === 0) continue;
-
-      for (const item of errorItems) {
-        ctx.waitUntil(persistError(env, event, item));
-        ctx.waitUntil(maybeNotify(env, event, item));
+      for (const item of collectErrors(event)) {
+        errors.push({
+          ts: event.eventTimestamp,
+          scriptName: event.scriptName,
+          outcome: event.outcome,
+          kind: item.kind,
+          message: item.message,
+        });
       }
     }
+    if (errors.length === 0) return;
+    ctx.waitUntil(handleTailErrors(env, errors));
   },
 
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/errors") {
       return handleGetErrors(request, env, url);
@@ -81,7 +101,14 @@ export default {
     if (url.pathname === "/health") {
       return new Response("ok", { status: 200 });
     }
+    const obsResponse = await routeObsRequest(request, env, ctx, url.pathname);
+    if (obsResponse) return obsResponse;
     return new Response("not found", { status: 404 });
+  },
+
+  /** OBS_RETRY_QUEUE の consumer: Notion に書けなかった観測性イベントを再送する */
+  async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
+    await consumeRetryBatch(batch, env);
   },
 };
 
@@ -90,13 +117,17 @@ interface ErrorItem {
   message: string;
 }
 
-interface StoredError {
+/** tail で拾ったエラー 1 件 */
+interface TailError {
   ts: number;
   scriptName: string | null;
   outcome: string;
   kind: "log" | "exception";
   message: string;
 }
+
+/** ERROR_LOG_KV に保存する形 (message は 4000 文字まで) */
+type StoredError = TailError;
 
 function collectErrors(event: TailEvent): ErrorItem[] {
   const items: ErrorItem[] = [];
@@ -143,94 +174,106 @@ function stringifyMessage(parts: unknown[]): string {
     .join(" ");
 }
 
-async function persistError(
+/**
+ * 1 回の tail 呼び出しで拾ったエラーを処理する:
+ * 全件を ERROR_LOG_KV に保存し、60 秒以内に通知していないものだけまとめて観測性 DB に記録する。
+ */
+async function handleTailErrors(env: Env, errors: TailError[]): Promise<void> {
+  // メッセージ先頭 200 文字の hash は、履歴のキーと重複抑制のキーの両方に使う
+  const hashes = await Promise.all(
+    errors.map((e) => sha256Hex(e.message.slice(0, MESSAGE_TRUNCATE), MESSAGE_HASH_BYTES)),
+  );
+  const [, notify] = await Promise.all([
+    Promise.all(errors.map((e, i) => persistError(env, e, hashes[i]))),
+    selectNotifiable(env, errors, hashes),
+  ]);
+
+  if (notify.payloads.length > 0) {
+    // 受付エンドポイントと同じ処理を直接呼ぶ (Notion 書き込み + 失敗時は再送キュー)
+    const results = await processPayloads(env, notify.payloads, new InvocationBudget());
+    for (const res of results) {
+      if (!res.notion.ok && !res.notion.queued) {
+        console.log(
+          JSON.stringify({ type: "obs_notify_error", error_code: res.notion.error_code }),
+        );
+      }
+    }
+  }
+  // 重複抑制の KV が失敗したエラーは通知せず、失敗として waitUntil に返す (他のエラーの通知は止めない)
+  if (notify.failures.length > 0) {
+    throw new AggregateError(notify.failures, "tail dedup KV failed");
+  }
+}
+
+/**
+ * 通知するエラーを選ぶ。同じ Worker の同じメッセージ (先頭 200 文字) は 60 秒に 1 回。
+ * 同じ呼び出しの中で重なったものも 1 回にまとめる。
+ */
+async function selectNotifiable(
   env: Env,
-  event: TailEvent,
-  item: ErrorItem,
-): Promise<void> {
+  errors: TailError[],
+  hashes: string[],
+): Promise<{ payloads: ObsNotifyPayload[]; failures: unknown[] }> {
+  const candidates = new Map<string, TailError>();
+  errors.forEach((e, i) => {
+    const key = `${e.scriptName ?? "unknown"}:${hashes[i]}`;
+    if (!candidates.has(key)) candidates.set(key, e);
+  });
+
+  const entries = [...candidates];
+  const claims = await Promise.allSettled(
+    entries.map(([key]) => claimOnce(env.DEDUP_KV, key)),
+  );
+  const payloads: ObsNotifyPayload[] = [];
+  const failures: unknown[] = [];
+  claims.forEach((claim, i) => {
+    if (claim.status === "rejected") failures.push(claim.reason);
+    else if (claim.value) payloads.push(tailPayload(entries[i][1]));
+  });
+  return { payloads, failures };
+}
+
+function tailPayload(e: TailError): ObsNotifyPayload {
+  const scriptName = e.scriptName ?? "unknown";
+  const repo = SCRIPT_TO_REPO[scriptName];
+  return {
+    severity: "warning",
+    service: "cf-worker",
+    subject: `⚠ ${scriptName} ${e.kind}`,
+    summary: e.message.slice(0, 1500),
+    ...(repo ? { repo } : {}),
+    raw_payload: {
+      scriptName,
+      outcome: e.outcome,
+      kind: e.kind,
+      message: e.message.slice(0, 1500),
+    },
+  };
+}
+
+async function persistError(env: Env, e: TailError, hash: string): Promise<void> {
   // key: `error:{ts_ms_padded}:{shortHash}` → KV list({prefix:"error:"}) で時系列順に取れる
-  const ts = event.eventTimestamp;
-  const tsKey = String(ts).padStart(13, "0");
-  const hash = await sha256(item.message.slice(0, MESSAGE_TRUNCATE));
+  const tsKey = String(e.ts).padStart(13, "0");
   const key = `error:${tsKey}:${hash}`;
 
   const value: StoredError = {
-    ts,
-    scriptName: event.scriptName,
-    outcome: event.outcome,
-    kind: item.kind,
-    message: item.message.slice(0, 4000), // KV value 上限考慮、十分長い
+    ts: e.ts,
+    scriptName: e.scriptName,
+    outcome: e.outcome,
+    kind: e.kind,
+    message: e.message.slice(0, 4000), // KV value 上限考慮、十分長い
   };
 
   try {
     await env.ERROR_LOG_KV.put(key, JSON.stringify(value), {
       expirationTtl: ERROR_LOG_TTL_SEC,
     });
-  } catch (e) {
+  } catch (err) {
     // 永続化失敗は本処理を止めない
     console.log(
       JSON.stringify({
         type: "error_log_persist_fail",
-        error: e instanceof Error ? e.message : String(e),
-      }),
-    );
-  }
-}
-
-async function maybeNotify(
-  env: Env,
-  event: TailEvent,
-  item: ErrorItem,
-): Promise<void> {
-  if (!env.OBS_NOTIFY_URL) return;
-
-  const truncated = item.message.slice(0, MESSAGE_TRUNCATE);
-  const hash = await sha256(truncated);
-  const dedupKey = `${event.scriptName ?? "unknown"}:${hash}`;
-
-  const cached = await env.DEDUP_KV.get(dedupKey);
-  if (cached !== null) {
-    // 60 秒以内に同一通知済み → skip
-    return;
-  }
-
-  await env.DEDUP_KV.put(dedupKey, "1", { expirationTtl: DEDUP_TTL_SEC });
-
-  const scriptName = event.scriptName ?? "unknown";
-  const repo = SCRIPT_TO_REPO[scriptName];
-  const payload = {
-    severity: "warning" as const,
-    service: "cf-worker",
-    subject: `⚠ ${scriptName} ${item.kind}`,
-    summary: item.message.slice(0, 1500),
-    ...(repo ? { repo } : {}),
-    raw_payload: {
-      scriptName,
-      outcome: event.outcome,
-      kind: item.kind,
-      message: item.message.slice(0, 1500),
-    },
-  };
-
-  try {
-    const resp = await fetch(env.OBS_NOTIFY_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!resp.ok) {
-      console.log(
-        JSON.stringify({
-          type: "obs_notify_error",
-          status: resp.status,
-        }),
-      );
-    }
-  } catch (e) {
-    console.log(
-      JSON.stringify({
-        type: "obs_notify_exception",
-        error: e instanceof Error ? e.message : String(e),
+        error: errorMessage(err),
       }),
     );
   }
@@ -246,7 +289,8 @@ async function handleGetErrors(
     return new Response("READ_TOKEN not configured", { status: 503 });
   }
   const auth = request.headers.get("Authorization") ?? "";
-  if (!auth.startsWith("Bearer ") || auth.slice(7).trim() !== env.READ_TOKEN) {
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+  if (!(await matchesSecret([token], env.READ_TOKEN))) {
     return new Response("unauthorized", { status: 401 });
   }
 
@@ -321,12 +365,4 @@ function parseSince(s: string): number {
   const factor =
     unit === "s" ? 1000 : unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000;
   return n * factor;
-}
-
-async function sha256(s: string): Promise<string> {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
-  return Array.from(new Uint8Array(buf))
-    .slice(0, 8)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
 }

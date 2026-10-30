@@ -18,6 +18,21 @@ id = "dbdc4e6dc46b440785f1f5bc6b806adc"
 binding = "ERROR_LOG_KV"
 id = "b4dec24c7d1b47a8b7028597574e73ab"
 
+# 観測性イベントの再送キュー: Notion に書けなかったイベント (ページのプロパティ) を積み、
+# queue ハンドラが 30 秒おきに書き直す。何回で諦めるかはコード (src/obs/process.ts の
+# QUEUE_MAX_RETRIES = 5) が決めて ack する。max_retries はハンドラが例外で落ちたときの安全網で、
+# それより大きくしてある (dead letter queue なし)。
+# キューが存在しないと wrangler deploy が失敗するので、このブロックを main に入れる前に作っておく:
+#   bunx wrangler queues create obs-notify-retry
+[[queues.producers]]
+binding = "OBS_RETRY_QUEUE"
+queue = "obs-notify-retry"
+
+[[queues.consumers]]
+queue = "obs-notify-retry"
+max_batch_size = 10
+max_retries = 10
+
 # Workers Logs Dashboard でこの Worker 自身のログを観測（メタ）
 [observability]
 enabled = true
