@@ -11,12 +11,13 @@ warning を Discord に 1 日 1 通まとめる `cron/obs-daily-digest` は n8n 
 
 ```
 shirankedo / worldpulse-api / swipe-persona-api        各サービス・監視スクリプト        Sentry / Healthchecks.io / Grafana / Netdata
-   │  (tail_consumers でこの Worker を指定)              │ POST /obs-notify                   │ POST /obs-from/{name}[/{token}]
-   ▼                                                     │ (X-Webhook-Secret)                 │ (X-Adapter-Token かパス末尾)
+   │  (tail_consumers でこの Worker を指定)              │ POST /obs-notify                   │ POST /obs-from/{name}
+   ▼                                                     │ (X-Webhook-Secret)                 │ (X-Adapter-Token。Sentry だけパス末尾も可)
 observability-tail (この Worker) ◄──────────────────────┴────────────────────────────────────┘
    │  tail: level=error / exception、level=log の cron_failed を抽出
    │        DEDUP_KV (TTL 60s) で重複抑制、ERROR_LOG_KV (TTL 7d) に履歴保存、通知は受け口の処理を直接呼ぶ
-   │  受け口: 検証（許可 service / repo / severity・長さ・url）→ critical なら Discord → Notion
+   │  受け口: 本文 256,000 バイトまで → 検証（許可 service / repo / severity・長さ・url）
+   │        → critical なら Discord（同じ内容は 60 秒に 1 回）→ Notion
    │        Notion が 429 / 5xx なら 2 秒おきに最大 3 回、それでも駄目なら Queue obs-notify-retry で 30 秒おきに再送
    ▼
    ├──> Notion 観測性ログ DB (3552570f-e49f-80a6-9186-c1a14b7d9547)
@@ -39,19 +40,22 @@ observability-tail (この Worker) ◄──────────────
 - **tail event**（自動）— upstream Worker の log/exception を受信
 - **`GET /errors?since=1h&limit=200&script=<name>`** — KV から該当期間の error を JSON で返す。`Authorization: Bearer $READ_TOKEN` 必須
 - **`POST /obs-notify`** — `{ severity, service, subject, summary?, repo?, url?, raw_payload? }` を受ける（n8n の obs-notify と同じ）。`X-Webhook-Secret: $WEBHOOK_SECRET` 必須
-- **`POST /obs-from/{sentry|healthchecks|grafana|netdata}`** — 各 SaaS の webhook 形式を変換して同じ処理に流す。`X-Adapter-Token: $ADAPTER_TOKEN` か、ヘッダを付けられない SaaS（Sentry 等）は `/obs-from/{name}/{ADAPTER_TOKEN}`
-- 認証に失敗すると 403（本文なし）、未知のパスは 404、POST 以外は 405
+- **`POST /obs-from/{healthchecks|grafana|netdata}`** — 各 SaaS の webhook 形式を変換して同じ処理に流す。`X-Adapter-Token: $ADAPTER_TOKEN` 必須（パス末尾のトークンは受けない）。Grafana は 1 回に `alerts` の先頭 50 件まで扱い、切った件数を応答の `dropped` で返す
+- **`POST /obs-from/sentry/{SENTRY_ADAPTER_TOKEN}`** — Sentry は webhook にヘッダを付けられないので、パス末尾のトークンで認証する（専用の合言葉 `SENTRY_ADAPTER_TOKEN`。`X-Adapter-Token: $SENTRY_ADAPTER_TOKEN` でも可）。パスのトークンは Workers Logs の URL に残る
+- 認証に失敗すると 403（本文なし）、未知のパスは 404、POST 以外は 405。認証後、本文が 256,000 バイトを超えると 413、payload が不正なら 400（どちらも受け付けなかったことを観測性 DB に warning で残す）
+- critical の Discord 通知は、severity・service・subject が同じものを 60 秒に 1 回だけ送る（`DEDUP_KV`）。2 回目以降も Notion には記録する
 
 ## KV / Queue / Secret
 
 | 名前 | 用途 | TTL |
 |---|---|---|
-| `DEDUP_KV` | エラーメッセージ先頭 200 文字 hash を保存して重複抑制 | 60s |
+| `DEDUP_KV` | tail: エラーメッセージ先頭 200 文字 hash で重複抑制 / 受け口: critical の Discord 通知の重複抑制 | 60s |
 | `ERROR_LOG_KV` | 構造化 error log を保存（AI クエリ用） | 7d |
 | Queue `obs-notify-retry`（binding `OBS_RETRY_QUEUE`） | Notion に書けなかったアラートの再送。最大 5 回、無料プランの保持は 24 時間 | — |
 | `READ_TOKEN` (secret) | `/errors` API の Bearer 認証 | — |
 | `WEBHOOK_SECRET` (secret) | `/obs-notify` の `X-Webhook-Secret`（n8n の nginx と同じ値にすると、送り元はヘッダを変えずに URL だけ差し替えられる） | — |
-| `ADAPTER_TOKEN` (secret) | `/obs-from/*` の認証 | — |
+| `ADAPTER_TOKEN` (secret) | `/obs-from/{healthchecks,grafana,netdata}` の `X-Adapter-Token` | — |
+| `SENTRY_ADAPTER_TOKEN` (secret) | `/obs-from/sentry` 専用（パス末尾に入れるので、URL が漏れても他の受け口には使えないよう分けてある） | — |
 | `NOTION_TOKEN` (secret) | 観測性ログ DB に書ける Notion integration のトークン。未設定だと受け口は 503 を返す | — |
 | `DISCORD_CRITICAL_URL` (secret) | `#obs-critical` の webhook URL | — |
 
@@ -69,6 +73,7 @@ bunx wrangler queues create obs-notify-retry
 bunx wrangler secret put READ_TOKEN
 bunx wrangler secret put WEBHOOK_SECRET
 bunx wrangler secret put ADAPTER_TOKEN
+bunx wrangler secret put SENTRY_ADAPTER_TOKEN
 bunx wrangler secret put NOTION_TOKEN
 bunx wrangler secret put DISCORD_CRITICAL_URL
 
