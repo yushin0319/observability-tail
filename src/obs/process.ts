@@ -5,6 +5,7 @@
  * n8n との違い:
  * - Discord に送れなかったときは Notion の discord_channel を空にする (送っていない記録を
  *   「送った」と読ませない)。n8n の api/obs-notify は送信を試みた時点で discord_channel を入れる。
+ * - 同じ critical (severity + service + subject) は 60 秒に 1 回だけ Discord に送る。
  * - Notion に書けなかった分 (再試行を使い切った / 1 回の上限を超えた) は OBS_RETRY_QUEUE に積み、
  *   queue() ハンドラ (consumeRetryBatch) が後から書き込む。
  */
@@ -13,6 +14,7 @@ import { isDiscordOk, sendDiscord } from "./discord";
 import { formatResponse, type ObsNotifyResponse } from "./formatResponse";
 import {
   createNotionPage,
+  notAttempted,
   type NotionWriteResult,
   writeNotionWithRetry,
 } from "./notion";
@@ -23,23 +25,23 @@ import {
   type PreparedNotify,
   prepNotify,
 } from "./prepNotify";
+import { claimOnce, errorMessage, release, sha256Hex } from "./shared";
 import type { JsonObject, ObsEnv, ObsRetryMessage } from "./types";
 
 /** Queue に積むときの配信遅延・consumer の再試行間隔 */
 export const QUEUE_RETRY_DELAY_SEC = 30;
-/** wrangler.toml の [[queues.consumers]] max_retries と同じ値にする */
+/**
+ * consumer が再送をあきらめるまでの回数。ここが決める
+ * (wrangler.toml の max_retries はこれより大きくした安全網)。
+ */
 export const QUEUE_MAX_RETRIES = 5;
 /** Queues の delaySeconds の上限 (12 時間) */
 const QUEUE_MAX_DELAY_SEC = 43_200;
 /** sendBatch 1 回の上限 (Queues: 100 件 / 256KB) に余裕を持たせた値 */
 const QUEUE_BATCH_MAX_MESSAGES = 100;
 const QUEUE_BATCH_MAX_BYTES = 200_000;
-/** 1 メッセージの上限 (Queues: 128KB) に余裕を持たせた値 */
-const QUEUE_MESSAGE_MAX_BYTES = 120_000;
 /** consumer は wall time に余裕がある (15 分) ので締め切りを長めにとる */
 const CONSUMER_BUDGET_MS = 300_000;
-/** 同じ critical を Discord に再送しない時間 (tail の重複抑制と同じ 60 秒) */
-const CRITICAL_DEDUP_TTL_SEC = 60;
 
 interface DeliveryState {
   prep: PreparedNotify;
@@ -71,29 +73,9 @@ export async function deliverPrepared(
 
   for (const prep of prepared) {
     // 1) critical は Discord へ即時送信。失敗しても Notion への記録は続ける
-    let discordRes: JsonObject | null = null;
-    let deduplicated = false;
-    if (prep.sendDiscordNow) {
-      const dedupKey = env.DEDUP_KV ? await criticalDedupKey(prep) : null;
-      if (dedupKey && (await kvOrFallback(() => env.DEDUP_KV!.get(dedupKey), null)) !== null) {
-        // 60 秒以内に同じ critical を送っている → Discord は鳴らさず Notion にだけ記録する
-        deduplicated = true;
-      } else if (budget.takeDiscordCall()) {
-        if (dedupKey) {
-          await kvOrFallback(
-            () => env.DEDUP_KV!.put(dedupKey, "1", { expirationTtl: CRITICAL_DEDUP_TTL_SEC }),
-            undefined,
-          );
-        }
-        discordRes = await sendDiscord(prep.discordUrl, prep.discordBody);
-        // 送れなかったら印を消し、次に来た同じアラートで送り直せるようにする
-        if (dedupKey && !isDiscordOk(discordRes)) {
-          await kvOrFallback(() => env.DEDUP_KV!.delete(dedupKey), undefined);
-        }
-      } else {
-        discordRes = { error: "discord call budget exhausted" };
-      }
-    }
+    const { discordRes, deduplicated } = prep.sendDiscordNow
+      ? await notifyDiscord(env, prep, budget)
+      : { discordRes: null, deduplicated: false };
     const notionBody = isDiscordOk(discordRes)
       ? prep.notionBody
       : withoutDiscordChannel(prep.notionBody);
@@ -101,25 +83,13 @@ export async function deliverPrepared(
     // 2) Notion に書き込む。上限超過・Notion 停止中は試さずに Queue へ回す
     let result: NotionWriteResult;
     if (!env.NOTION_TOKEN) {
-      result = {
-        ok: false,
-        status: null,
-        message: "NOTION_TOKEN not configured",
-        retryable: false,
-        attempts: 0,
-      };
-    } else if (budget.notionDown || !budget.takeWrite()) {
-      result = {
-        ok: false,
-        status: null,
-        message: "deferred to retry queue",
-        retryable: true,
-        attempts: 0,
-      };
+      result = notAttempted("NOTION_TOKEN not configured", false);
+    } else if (!budget.take("write")) {
+      result = notAttempted("deferred to retry queue", true);
     } else {
       result = await writeNotionWithRetry(env.NOTION_TOKEN, notionBody, budget);
       if (!result.ok && result.retryable && result.attempts > 0) {
-        budget.notionDown = true;
+        budget.reportNotionFailure();
       }
     }
     if (!result.ok) {
@@ -146,7 +116,7 @@ export async function deliverPrepared(
   return states.map(toResponse);
 }
 
-/** 検証 + 送信。maybeNotify (tail 経路) から直接呼ぶ */
+/** 検証 + 送信。tail 経路から直接呼ぶ */
 export async function processPayloads(
   env: ObsEnv,
   payloads: unknown[],
@@ -157,7 +127,7 @@ export async function processPayloads(
 
 /**
  * 受け付けられなかった payload の記録 (n8n では WF の失敗が system/error-handler 経由で
- * 観測性 DB に warning として残っていた。それに相当する)。
+ * 観測性 DB に warning として残る。それに相当する)。
  */
 export function rejectionPayload(
   route: string,
@@ -176,45 +146,48 @@ export function rejectionPayload(
   });
 }
 
+/**
+ * critical を Discord に送る。60 秒以内に同じものを送っていれば鳴らさない。
+ * 重複抑制の KV が失敗しても通知は止めない (重複抑制なしで送る)。
+ */
+async function notifyDiscord(
+  env: ObsEnv,
+  prep: PreparedNotify,
+  budget: InvocationBudget,
+): Promise<{ discordRes: JsonObject | null; deduplicated: boolean }> {
+  const kv = env.DEDUP_KV;
+  const key = kv
+    ? `critical:${await sha256Hex(`${prep.severity}\n${prep.service}\n${prep.subject}`, 16)}`
+    : null;
+  const claimed = kv && key ? await kvOrFallback(() => claimOnce(kv, key), true) : true;
+  if (!claimed) return { discordRes: null, deduplicated: true };
+
+  const discordRes = budget.take("discord")
+    ? await sendDiscord(prep.discordUrl, prep.discordBody)
+    : { error: "discord call budget exhausted" };
+  // 送れなかったら印を消し、次に来た同じアラートで送り直せるようにする
+  if (kv && key && !isDiscordOk(discordRes)) {
+    await kvOrFallback(() => release(kv, key), undefined);
+  }
+  return { discordRes, deduplicated: false };
+}
+
+/** critical の重複抑制の KV 操作。KV が使えなければ fallback で進める */
+async function kvOrFallback<T>(op: () => Promise<T>, fallback: T): Promise<T> {
+  try {
+    return await op();
+  } catch (e) {
+    const error = errorMessage(e);
+    console.log(JSON.stringify({ type: "obs_critical_dedup_kv_error", error }));
+    return fallback;
+  }
+}
+
 function withoutDiscordChannel(body: NotionPageBody): NotionPageBody {
   if (!("discord_channel" in body.properties)) return body;
   const properties = { ...body.properties };
   delete properties.discord_channel;
   return { ...body, properties };
-}
-
-function isObservabilityDbBody(notionBody: unknown): notionBody is JsonObject {
-  if (typeof notionBody !== "object" || notionBody === null) return false;
-  const parent = (notionBody as JsonObject).parent as JsonObject | undefined;
-  return parent?.database_id === OBS_DB_ID;
-}
-
-/** severity + service + subject が同じ critical を同じアラートとみなす */
-async function criticalDedupKey(prep: PreparedNotify): Promise<string> {
-  const source = `${prep.severity}\n${prep.service}\n${prep.subject}`;
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source));
-  const hex = Array.from(new Uint8Array(buf).slice(0, 16))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-  return `critical:${hex}`;
-}
-
-/**
- * 重複抑制の KV 操作。KV が失敗しても critical の通知は止めない
- * (重複抑制なしで送る方を選ぶ) ので、失敗はログに残して fallback を返す。
- */
-async function kvOrFallback<T>(op: () => Promise<T>, fallback: T): Promise<T> {
-  try {
-    return await op();
-  } catch (e) {
-    console.log(
-      JSON.stringify({
-        type: "obs_critical_dedup_kv_error",
-        error: e instanceof Error ? e.message : String(e),
-      }),
-    );
-    return fallback;
-  }
 }
 
 function toResponse(s: DeliveryState): ObsNotifyResponse {
@@ -252,23 +225,18 @@ async function enqueueRetries(
   const queue = env.OBS_RETRY_QUEUE;
   if (!queue || pending.length === 0) return;
 
-  // sendBatch の件数・サイズ上限に合わせて分割する
+  // sendBatch の件数・サイズ上限に合わせて分割する。1 件の大きさはプロパティの文字数制限で
+  // 数十 KB 以内に収まる (Queues の 1 メッセージ上限 128KB に届かない)
   const encoder = new TextEncoder();
   const chunks: { state: DeliveryState; req: MessageSendRequest<ObsRetryMessage> }[][] = [];
   let current: (typeof chunks)[number] = [];
   let currentBytes = 0;
   for (const state of pending) {
     const body: ObsRetryMessage = {
-      notionBody: state.notionBody,
+      properties: state.notionBody.properties,
       subject: state.prep.subject.slice(0, 200),
     };
     const bytes = encoder.encode(JSON.stringify(body)).byteLength;
-    if (bytes > QUEUE_MESSAGE_MAX_BYTES) {
-      console.log(
-        JSON.stringify({ type: "obs_retry_too_large", subject: body.subject, bytes }),
-      );
-      continue;
-    }
     if (
       current.length >= QUEUE_BATCH_MAX_MESSAGES ||
       currentBytes + bytes > QUEUE_BATCH_MAX_BYTES
@@ -286,7 +254,7 @@ async function enqueueRetries(
   if (current.length > 0) chunks.push(current);
 
   for (const chunk of chunks) {
-    if (!budget.takeQueueCall()) {
+    if (!budget.take("queue")) {
       console.log(
         JSON.stringify({ type: "obs_retry_queue_budget_exhausted", dropped: chunk.length }),
       );
@@ -296,12 +264,10 @@ async function enqueueRetries(
       await queue.sendBatch(chunk.map((c) => c.req));
       for (const c of chunk) c.state.queued = true;
     } catch (e) {
+      // 積めなかった分は queued にならず、応答で「書けなかった」と返る
+      const error = errorMessage(e);
       console.log(
-        JSON.stringify({
-          type: "obs_retry_enqueue_failed",
-          count: chunk.length,
-          error: e instanceof Error ? e.message : String(e),
-        }),
+        JSON.stringify({ type: "obs_retry_enqueue_failed", count: chunk.length, error }),
       );
     }
   }
@@ -310,45 +276,54 @@ async function enqueueRetries(
 /**
  * 再送キューの consumer。1 メッセージにつき Notion を 1 回だけ呼び、
  * 成功 → ack / 429・5xx → 30 秒後に retry / それ以外の失敗 → 記録して ack。
- * max_retries を使い切った配信で失敗したら、ログに残して ack する (以降は再送されない)。
+ * QUEUE_MAX_RETRIES 回再送しても書けなければ、ログに残して ack する。
+ * 書き込み先は常に観測性 DB (メッセージは properties だけを持つ)。
  */
 export async function consumeRetryBatch(
   batch: MessageBatch<unknown>,
   env: ObsEnv,
 ): Promise<void> {
-  const budget = new InvocationBudget({ budgetMs: CONSUMER_BUDGET_MS });
+  const budget = new InvocationBudget(CONSUMER_BUDGET_MS);
   for (const msg of batch.messages) {
     const body = msg.body as Partial<ObsRetryMessage> | null;
-    // 書き込み先は観測性 DB だけ。それ以外を指すメッセージは書かずに捨てる
-    if (!body || !isObservabilityDbBody(body.notionBody)) {
+    const properties = body?.properties;
+    if (typeof properties !== "object" || properties === null) {
       console.log(JSON.stringify({ type: "obs_retry_invalid_message", id: msg.id }));
       msg.ack();
       continue;
     }
+    const subject = body?.subject ?? "";
     if (!env.NOTION_TOKEN || !(await budget.acquireNotionCall())) {
-      msg.retry({ delaySeconds: QUEUE_RETRY_DELAY_SEC });
+      retryOrGiveUp(msg, { id: msg.id, subject, status: null, message: "not attempted" });
       continue;
     }
-    const r = await createNotionPage(env.NOTION_TOKEN, body.notionBody);
+    const r = await createNotionPage(env.NOTION_TOKEN, {
+      parent: { database_id: OBS_DB_ID },
+      properties,
+    });
     if (r.ok) {
       msg.ack();
       continue;
     }
-    const logBase = {
-      id: msg.id,
-      subject: body.subject ?? "",
-      status: r.status,
-      attempts: msg.attempts,
-      message: r.message.slice(0, 300),
-    };
+    const log = { id: msg.id, subject, status: r.status, message: r.message.slice(0, 300) };
     if (!r.retryable) {
-      console.log(JSON.stringify({ type: "obs_retry_dropped", ...logBase }));
-      msg.ack();
-    } else if (msg.attempts > QUEUE_MAX_RETRIES) {
-      console.log(JSON.stringify({ type: "obs_retry_giveup", ...logBase }));
+      console.log(JSON.stringify({ type: "obs_retry_dropped", attempts: msg.attempts, ...log }));
       msg.ack();
     } else {
-      msg.retry({ delaySeconds: retryDelaySeconds(r.retryAfterSec) });
+      retryOrGiveUp(msg, log, r.retryAfterSec);
     }
+  }
+}
+
+function retryOrGiveUp(
+  msg: Message<unknown>,
+  log: JsonObject,
+  retryAfterSec?: number,
+): void {
+  if (msg.attempts > QUEUE_MAX_RETRIES) {
+    console.log(JSON.stringify({ type: "obs_retry_giveup", attempts: msg.attempts, ...log }));
+    msg.ack();
+  } else {
+    msg.retry({ delaySeconds: retryDelaySeconds(retryAfterSec) });
   }
 }

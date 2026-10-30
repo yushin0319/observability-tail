@@ -4,6 +4,7 @@
  * formatResponse にそのまま渡せるようにする: 応答があれば { statusCode }、通信失敗は { error }。
  */
 import { fetchWithTimeout } from "./budget";
+import { errorMessage } from "./shared";
 import type { JsonObject } from "./types";
 
 export async function sendDiscord(
@@ -20,7 +21,7 @@ export async function sendDiscord(
     await resp.text().catch(() => "");
     return { statusCode: resp.status };
   } catch (e) {
-    return { error: e instanceof Error ? e.message : String(e) };
+    return { error: errorMessage(e) };
   }
 }
 

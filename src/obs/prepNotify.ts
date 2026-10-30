@@ -3,6 +3,7 @@
  * n8n-server の code-nodes/api-obs-notify/PrepNotify.ts を純関数にしたもの。
  * 許可リスト・文字数制限・url 検証・Notion プロパティ対応は n8n 側と同じ。
  */
+import { HTTP_URL } from "./shared";
 import type { JsonObject } from "./types";
 
 export const OBS_DB_ID = "3552570f-e49f-80a6-9186-c1a14b7d9547";
@@ -115,7 +116,7 @@ export function prepNotify(
   const url =
     typeof rawUrl === "string" &&
     rawUrl.length <= URL_MAX_LENGTH &&
-    /^https?:\/\//.test(rawUrl)
+    HTTP_URL.test(rawUrl)
       ? rawUrl
       : "";
   const rawPayload = body.raw_payload;

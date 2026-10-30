@@ -5,9 +5,12 @@
 /** JSON オブジェクト (n8n の IDataObject 相当) */
 export type JsonObject = Record<string, unknown>;
 
-/** Queue に積む再送メッセージ。組み立て済みの Notion リクエスト本文をそのまま持つ */
+/**
+ * Queue に積む再送メッセージ。Notion ページのプロパティだけを持ち、
+ * 書き込み先 (観測性 DB) は consumer が付ける。
+ */
 export interface ObsRetryMessage {
-  notionBody: JsonObject;
+  properties: JsonObject;
   /** ログで見分けるための subject (先頭 200 文字) */
   subject: string;
 }

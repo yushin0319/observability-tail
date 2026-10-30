@@ -1,20 +1,13 @@
 /**
- * 受付エンドポイントの認証。
- * 比較は両方を SHA-256 にしてから全バイトを XOR で見る (長さ・一致位置で時間が変わらない)。
+ * 受付エンドポイント・/errors の認証。
+ * 比較は両方を SHA-256 にしてから全文字を XOR で見る (長さ・一致位置で時間が変わらない)。
  */
+import { sha256Hex } from "./shared";
 
-async function digest(s: string): Promise<Uint8Array> {
-  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
-  return new Uint8Array(buf);
-}
-
-export async function timingSafeEqualString(
-  a: string,
-  b: string,
-): Promise<boolean> {
-  const [da, db] = await Promise.all([digest(a), digest(b)]);
+async function timingSafeEqualString(a: string, b: string): Promise<boolean> {
+  const [ha, hb] = await Promise.all([sha256Hex(a), sha256Hex(b)]);
   let diff = 0;
-  for (let i = 0; i < da.length; i++) diff |= da[i] ^ db[i];
+  for (let i = 0; i < ha.length; i++) diff |= ha.charCodeAt(i) ^ hb.charCodeAt(i);
   return diff === 0;
 }
 

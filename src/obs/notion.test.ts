@@ -4,9 +4,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InvocationBudget } from "./budget";
-import { parseRetryAfter, writeNotionWithRetry } from "./notion";
+import { NOTION_PAGES_URL, parseRetryAfter, writeNotionWithRetry } from "./notion";
 import {
-  NOTION_URL,
   notionError,
   notionPage,
   settle,
@@ -16,7 +15,6 @@ import {
 
 const BODY = { parent: { database_id: "db" }, properties: {} };
 
-const run = settle;
 
 describe("parseRetryAfter", () => {
   it("秒数をそのまま返す", () => {
@@ -46,12 +44,12 @@ describe("writeNotionWithRetry", () => {
 
   it("Notion API に Bearer token / Notion-Version 2022-06-28 で POST する", async () => {
     const { notionCalls } = stubFetch();
-    const r = await run(writeNotionWithRetry("secret-token", BODY, new InvocationBudget()));
+    const r = await settle(writeNotionWithRetry("secret-token", BODY, new InvocationBudget()));
     expect(r.ok).toBe(true);
     expect(r.page).toEqual({ object: "page", id: "page-1" });
     expect(notionCalls).toHaveLength(1);
     const headers = notionCalls[0].init.headers as Record<string, string>;
-    expect(notionCalls[0].url).toBe(NOTION_URL);
+    expect(notionCalls[0].url).toBe(NOTION_PAGES_URL);
     expect(notionCalls[0].init.method).toBe("POST");
     expect(headers.Authorization).toBe("Bearer secret-token");
     expect(headers["Notion-Version"]).toBe("2022-06-28");
@@ -62,7 +60,7 @@ describe("writeNotionWithRetry", () => {
     const { notionCalls } = stubFetch({
       notion: (_c, n) => (n < 3 ? notionError(503) : notionPage("p3")),
     });
-    const r = await run(writeNotionWithRetry("t", BODY, new InvocationBudget()));
+    const r = await settle(writeNotionWithRetry("t", BODY, new InvocationBudget()));
     expect(r.ok).toBe(true);
     expect(r.attempts).toBe(3);
     expect(notionCalls[1].at - notionCalls[0].at).toBe(2000);
@@ -71,7 +69,7 @@ describe("writeNotionWithRetry", () => {
 
   it("3 回とも 5xx → retryable のまま返す (呼び出し側が Queue に回す)", async () => {
     const { notionCalls } = stubFetch({ notion: () => notionError(500) });
-    const r = await run(writeNotionWithRetry("t", BODY, new InvocationBudget()));
+    const r = await settle(writeNotionWithRetry("t", BODY, new InvocationBudget()));
     expect(r).toMatchObject({ ok: false, status: 500, retryable: true, attempts: 3 });
     expect(notionCalls).toHaveLength(3);
   });
@@ -84,7 +82,7 @@ describe("writeNotionWithRetry", () => {
           { status: 400 },
         ),
     });
-    const r = await run(writeNotionWithRetry("t", BODY, new InvocationBudget()));
+    const r = await settle(writeNotionWithRetry("t", BODY, new InvocationBudget()));
     expect(r).toMatchObject({ ok: false, status: 400, retryable: false, attempts: 1 });
     expect(r.message).toBe("bad select");
     expect(notionCalls).toHaveLength(1);
@@ -94,7 +92,7 @@ describe("writeNotionWithRetry", () => {
     const { notionCalls } = stubFetch({
       notion: (_c, n) => (n === 1 ? notionError(429, { "Retry-After": "5" }) : notionPage("p")),
     });
-    const r = await run(writeNotionWithRetry("t", BODY, new InvocationBudget()));
+    const r = await settle(writeNotionWithRetry("t", BODY, new InvocationBudget()));
     expect(r.ok).toBe(true);
     expect(notionCalls[1].at - notionCalls[0].at).toBe(5000);
   });
@@ -103,7 +101,7 @@ describe("writeNotionWithRetry", () => {
     const { notionCalls } = stubFetch({
       notion: () => notionError(429, { "Retry-After": "30" }),
     });
-    const r = await run(writeNotionWithRetry("t", BODY, new InvocationBudget()));
+    const r = await settle(writeNotionWithRetry("t", BODY, new InvocationBudget()));
     expect(r).toMatchObject({ ok: false, status: 429, retryable: true, attempts: 1, retryAfterSec: 30 });
     expect(notionCalls).toHaveLength(1);
   });
@@ -118,7 +116,7 @@ describe("writeNotionWithRetry", () => {
         return notionPage("p");
       }),
     );
-    const r = await run(writeNotionWithRetry("t", BODY, new InvocationBudget()));
+    const r = await settle(writeNotionWithRetry("t", BODY, new InvocationBudget()));
     expect(r.ok).toBe(true);
     expect(r.attempts).toBe(2);
   });
@@ -134,16 +132,16 @@ describe("writeNotionWithRetry", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     const started = Date.now();
-    const r = await run(writeNotionWithRetry("t", BODY, new InvocationBudget()));
+    const r = await settle(writeNotionWithRetry("t", BODY, new InvocationBudget()));
     expect(r).toMatchObject({ ok: false, status: null, retryable: true, attempts: 1 });
     expect(Date.now() - started).toBe(10_000);
   });
 
-  it("Notion 呼び出しの枠を使い切っていたら呼ばずに返す", async () => {
+  it("この invocation で Notion 停止が分かっていたら呼ばずに返す", async () => {
     const { notionCalls } = stubFetch();
     const budget = new InvocationBudget();
-    budget.notionCallsLeft = 0;
-    const r = await run(writeNotionWithRetry("t", BODY, budget));
+    budget.reportNotionFailure();
+    const r = await settle(writeNotionWithRetry("t", BODY, budget));
     expect(r).toMatchObject({ ok: false, retryable: true, attempts: 0 });
     expect(notionCalls).toHaveLength(0);
   });

@@ -7,6 +7,7 @@ import worker from "../index";
 import { MAX_BODY_BYTES } from "./routes";
 import {
   DISCORD_URL,
+  makeCtx,
   makeKV,
   makeQueue,
   notionError,
@@ -32,17 +33,6 @@ function makeEnv(overrides: Record<string, unknown> = {}) {
     DISCORD_CRITICAL_URL: DISCORD_URL,
     ...overrides,
   };
-}
-
-function makeCtx() {
-  const promises: Promise<unknown>[] = [];
-  return {
-    promises,
-    waitUntil: (p: Promise<unknown>) => {
-      promises.push(p);
-    },
-    passThroughOnException: () => {},
-  } as unknown as ExecutionContext & { promises: Promise<unknown>[] };
 }
 
 function post(path: string, body: unknown, headers: Record<string, string> = {}): Request {
@@ -246,9 +236,27 @@ describe("本文の大きさ (256,000 バイトまで)", () => {
     const padding = "x".repeat(MAX_BODY_BYTES - baseBytes);
     const body = JSON.stringify({ ...validNotify, summary: padding });
     expect(new TextEncoder().encode(body).byteLength).toBe(MAX_BODY_BYTES);
-    const r = await call(post("/obs-notify", body, { "X-Webhook-Secret": WEBHOOK_SECRET }));
-    expect(r.status).toBe(200);
-    expect(notionCalls).toHaveLength(1);
+    // Content-Length なし (ストリームで数える) と、あり (そのまま読む) の両方
+    const r1 = await call(post("/obs-notify", body, { "X-Webhook-Secret": WEBHOOK_SECRET }));
+    const r2 = await call(
+      post("/obs-notify", body, {
+        "X-Webhook-Secret": WEBHOOK_SECRET,
+        "Content-Length": String(MAX_BODY_BYTES),
+      }),
+    );
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    expect(notionCalls).toHaveLength(2);
+    expect(notionCalls[1].json).toEqual(notionCalls[0].json);
+  });
+
+  it("JSON が読めないときは本文の先頭 2000 字をそのまま記録する", async () => {
+    const { notionCalls } = stubFetch();
+    const text = `{not json ${"y".repeat(3000)}`;
+    const r = await call(post("/obs-notify", text, { "X-Webhook-Secret": WEBHOOK_SECRET }));
+    expect(r.status).toBe(400);
+    const props = notionCalls[0].json.properties as Record<string, any>;
+    expect(props.raw_payload.rich_text[0].text.content).toBe(text.slice(0, 2000));
   });
 
   it("認証の前には本文を見ない (認証失敗は 413 ではなく 403)", async () => {

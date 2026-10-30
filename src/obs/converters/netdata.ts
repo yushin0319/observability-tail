@@ -3,6 +3,7 @@
  * n8n-server の code-nodes/api-obs-from-netdata/ConvertNetdata.ts を純関数にしたもの。
  */
 import type { ObsNotifyPayload } from "../obsNotifyPayload";
+import { HOST_TO_REPO as BASE_HOST_TO_REPO, HTTP_URL } from "../shared";
 import type { JsonObject } from "../types";
 
 const STATUS_TO_SEVERITY: Record<string, "critical" | "warning" | "info"> = {
@@ -15,13 +16,9 @@ const STATUS_TO_SEVERITY: Record<string, "critical" | "warning" | "info"> = {
 };
 
 const HOST_TO_REPO: Record<string, string> = {
-  "n8n-server": "n8n-server",
-  "crypto-ai-trader": "crypto-ai-trader",
-  "crypto-ai-trader-runner": "crypto-ai-trader",
+  ...BASE_HOST_TO_REPO,
   "instance-20260206-1437": "n8n-server",
 };
-
-const HTTP_URL = /^https?:\/\//;
 
 export function convertNetdata(input: unknown): ObsNotifyPayload[] {
   const body = (input as JsonObject) || ({} as JsonObject);

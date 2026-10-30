@@ -6,6 +6,7 @@
  *   送信していない (sendDiscordNow=false) ときは null。
  * - notion: CreateNotionPage の出力 = 作成したページ / 再試行を使い切ったとき { error: { httpCode } }。
  */
+import { isDiscordOk } from "./discord";
 import type { JsonObject } from "./types";
 
 export interface PrepSummary {
@@ -51,7 +52,7 @@ export function formatResponse(
   if (prep.sendDiscordNow === true) {
     const res = discordRes ?? {};
     const status = typeof res.statusCode === "number" ? res.statusCode : null;
-    discord = { ok: status !== null && status >= 200 && status < 300, status };
+    discord = { ok: isDiscordOk(res), status };
   } else {
     discord = { ok: prep.severity !== "critical", status: null, skipped: true };
   }

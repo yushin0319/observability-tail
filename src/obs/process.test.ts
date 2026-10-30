@@ -29,7 +29,6 @@ function makeEnv(overrides: Partial<ObsEnv> = {}): ObsEnv {
   };
 }
 
-const run = settle;
 
 const warning = {
   severity: "warning",
@@ -62,7 +61,7 @@ afterEach(() => {
 describe("processPayloads", () => {
   it("warning: Discord には送らず Notion に書き、n8n と同じ形の応答を返す", async () => {
     const { notionCalls, discordCalls } = stubFetch();
-    const [res] = await run(processPayloads(makeEnv(), [warning]));
+    const [res] = await settle(processPayloads(makeEnv(), [warning]));
 
     expect(discordCalls).toHaveLength(0);
     expect(notionCalls).toHaveLength(1);
@@ -79,7 +78,7 @@ describe("processPayloads", () => {
 
   it("critical: Discord (@here) → Notion の順に送り、discord_channel を記録する", async () => {
     const { fetchMock, notionCalls, discordCalls } = stubFetch();
-    const [res] = await run(processPayloads(makeEnv(), [critical]));
+    const [res] = await settle(processPayloads(makeEnv(), [critical]));
 
     expect(fetchMock.mock.calls.map((c) => String(c[0]))).toEqual([
       DISCORD_URL,
@@ -96,7 +95,7 @@ describe("processPayloads", () => {
     const { notionCalls } = stubFetch({
       discord: () => new Response("oops", { status: 500 }),
     });
-    const [res] = await run(processPayloads(makeEnv(), [critical]));
+    const [res] = await settle(processPayloads(makeEnv(), [critical]));
 
     expect(notionCalls).toHaveLength(1);
     const props = notionCalls[0].json.properties as Record<string, any>;
@@ -117,7 +116,7 @@ describe("processPayloads", () => {
         return notionPage("p");
       }),
     );
-    const [res] = await run(processPayloads(makeEnv(), [critical]));
+    const [res] = await settle(processPayloads(makeEnv(), [critical]));
     expect(notionCalls).toHaveLength(1);
     expect(res.discord).toEqual({ ok: false, status: null });
     expect(res.notion).toEqual({ ok: true, page_id: "p", error_code: null });
@@ -125,7 +124,7 @@ describe("processPayloads", () => {
 
   it("critical でも DISCORD_CRITICAL_URL 未設定なら送らず success=false (n8n と同じ)", async () => {
     const { discordCalls, notionCalls } = stubFetch();
-    const [res] = await run(
+    const [res] = await settle(
       processPayloads(makeEnv({ DISCORD_CRITICAL_URL: undefined }), [critical]),
     );
     expect(discordCalls).toHaveLength(0);
@@ -137,15 +136,19 @@ describe("processPayloads", () => {
   it("Notion が 3 回とも 5xx → 再送キューに積み queued=true を返す", async () => {
     const { notionCalls } = stubFetch({ notion: () => notionError(503) });
     const { queue, sent } = makeQueue();
-    const [res] = await run(
+    const [res] = await settle(
       processPayloads(makeEnv({ OBS_RETRY_QUEUE: queue }), [warning]),
     );
 
     expect(notionCalls).toHaveLength(3);
     expect(sent).toHaveLength(1);
     expect(sent[0].delaySeconds).toBe(30);
-    expect(subjectOf(sent[0].body.notionBody)).toBe("⚠ shirankedo exception");
-    expect(sent[0].body.notionBody).toEqual(notionCalls[0].json);
+    expect(subjectOf(sent[0].body)).toBe("⚠ shirankedo exception");
+    // 再送メッセージはプロパティだけを持つ (書き込み先は consumer が付ける)
+    expect(Object.keys(sent[0].body).sort()).toEqual(["properties", "subject"]);
+    expect({ parent: { database_id: OBS_DB_ID }, properties: sent[0].body.properties }).toEqual(
+      notionCalls[0].json,
+    );
     expect(res.success).toBe(false);
     expect(res.notion).toEqual({
       ok: false,
@@ -157,7 +160,7 @@ describe("processPayloads", () => {
 
   it("Queue binding が無ければ書けなかったことだけ返す", async () => {
     stubFetch({ notion: () => notionError(502) });
-    const [res] = await run(processPayloads(makeEnv(), [warning]));
+    const [res] = await settle(processPayloads(makeEnv(), [warning]));
     expect(res.notion).toEqual({ ok: false, page_id: null, error_code: "502" });
   });
 
@@ -166,7 +169,7 @@ describe("processPayloads", () => {
       notion: () => Response.json({ object: "error", code: "validation_error" }, { status: 400 }),
     });
     const { queue, sent } = makeQueue();
-    const [res] = await run(
+    const [res] = await settle(
       processPayloads(makeEnv({ OBS_RETRY_QUEUE: queue }), [warning]),
     );
     expect(notionCalls).toHaveLength(1);
@@ -177,7 +180,7 @@ describe("processPayloads", () => {
   it("Retry-After が長い 429 は待たずに Queue へ。配信遅延に Retry-After を使う", async () => {
     stubFetch({ notion: () => notionError(429, { "Retry-After": "90" }) });
     const { queue, sent } = makeQueue();
-    await run(processPayloads(makeEnv({ OBS_RETRY_QUEUE: queue }), [warning]));
+    await settle(processPayloads(makeEnv({ OBS_RETRY_QUEUE: queue }), [warning]));
     expect(sent).toHaveLength(1);
     expect(sent[0].delaySeconds).toBe(90);
   });
@@ -192,9 +195,9 @@ describe("processPayloads", () => {
 
   it("Grafana 13 件: 10 件だけ 350ms 以上空けて書き、残り 3 件は 1 回の sendBatch で Queue へ", async () => {
     const { fetchMock, notionCalls } = stubFetch();
-    const { queue, sent, raw } = makeQueue();
+    const { queue, sent, sendBatch } = makeQueue();
     const payloads = convertGrafana(grafanaBody(13));
-    const results = await run(
+    const results = await settle(
       processPayloads(makeEnv({ OBS_RETRY_QUEUE: queue }), payloads),
     );
 
@@ -205,19 +208,19 @@ describe("processPayloads", () => {
     expect(notionCalls.map((c) => subjectOf(c.json))).toEqual(
       payloads.slice(0, 10).map((p) => p.subject),
     );
-    expect(raw.sendBatch).toHaveBeenCalledTimes(1);
+    expect(sendBatch).toHaveBeenCalledTimes(1);
     expect(sent.map((m) => m.body.subject)).toEqual(
       payloads.slice(10).map((p) => p.subject),
     );
     expect(results.filter((r) => r.notion.ok)).toHaveLength(10);
     expect(results.filter((r) => r.notion.queued)).toHaveLength(3);
     // subrequest: fetch 10 + Queue 1
-    expect(fetchMock.mock.calls.length + raw.sendBatch.mock.calls.length).toBe(11);
+    expect(fetchMock.mock.calls.length + sendBatch.mock.calls.length).toBe(11);
   });
 
   it("Grafana 13 件で Queue が無い → 3 件は書けなかったと返す", async () => {
     stubFetch();
-    const results = await run(
+    const results = await settle(
       processPayloads(makeEnv(), convertGrafana(grafanaBody(13))),
     );
     const failed = results.filter((r) => !r.notion.ok);
@@ -227,14 +230,14 @@ describe("processPayloads", () => {
 
   it("Grafana critical 30 件でも 1 invocation の subrequest は 50 より十分少ない", async () => {
     const { fetchMock } = stubFetch({ notion: (_c, n) => (n % 2 ? notionError(429) : notionPage(`p${n}`)) });
-    const { queue, raw } = makeQueue();
-    await run(
+    const { queue, sendBatch } = makeQueue();
+    await settle(
       processPayloads(
         makeEnv({ OBS_RETRY_QUEUE: queue }),
         convertGrafana(grafanaBody(30, "critical")),
       ),
     );
-    const total = fetchMock.mock.calls.length + raw.sendBatch.mock.calls.length;
+    const total = fetchMock.mock.calls.length + sendBatch.mock.calls.length;
     expect(total).toBeLessThanOrEqual(35);
   });
 
@@ -258,7 +261,7 @@ describe("processPayloads", () => {
     );
     const { queue, sent } = makeQueue();
     const started = Date.now();
-    const results = await run(
+    const results = await settle(
       processPayloads(
         makeEnv({ OBS_RETRY_QUEUE: queue }),
         convertGrafana(grafanaBody(5, "critical")),
@@ -273,7 +276,7 @@ describe("processPayloads", () => {
   it("1 件目で Notion が落ちていると分かったら、残りは試さず Queue に回す", async () => {
     const { notionCalls } = stubFetch({ notion: () => notionError(500) });
     const { queue, sent } = makeQueue();
-    const results = await run(
+    const results = await settle(
       processPayloads(makeEnv({ OBS_RETRY_QUEUE: queue }), convertGrafana(grafanaBody(4))),
     );
     expect(notionCalls).toHaveLength(3);
@@ -285,7 +288,7 @@ describe("processPayloads", () => {
     const { notionCalls } = stubFetch();
     const env = makeEnv();
     const budget = new InvocationBudget();
-    await run(
+    await settle(
       Promise.all([
         processPayloads(env, [warning], budget),
         processPayloads(env, [{ ...warning, subject: "2" }], budget),
@@ -300,7 +303,7 @@ describe("processPayloads", () => {
 
   it("NOTION_TOKEN 未設定なら Notion を呼ばず失敗を返す", async () => {
     const { notionCalls } = stubFetch();
-    const [res] = await run(
+    const [res] = await settle(
       processPayloads(makeEnv({ NOTION_TOKEN: undefined }), [warning]),
     );
     expect(notionCalls).toHaveLength(0);
@@ -314,8 +317,8 @@ describe("critical の Discord 重複抑制", () => {
     const { kv, store } = makeKV();
     const env = makeEnv({ DEDUP_KV: kv });
 
-    const [first] = await run(processPayloads(env, [critical]));
-    const [second] = await run(processPayloads(env, [critical]));
+    const [first] = await settle(processPayloads(env, [critical]));
+    const [second] = await settle(processPayloads(env, [critical]));
 
     expect(discordCalls).toHaveLength(1);
     expect(notionCalls).toHaveLength(2);
@@ -339,8 +342,8 @@ describe("critical の Discord 重複抑制", () => {
   it("subject が違えば別のアラートとして送る", async () => {
     const { discordCalls } = stubFetch();
     const env = makeEnv({ DEDUP_KV: makeKV().kv });
-    await run(processPayloads(env, [critical]));
-    await run(processPayloads(env, [{ ...critical, subject: "🚨 別件" }]));
+    await settle(processPayloads(env, [critical]));
+    await settle(processPayloads(env, [{ ...critical, subject: "🚨 別件" }]));
     expect(discordCalls).toHaveLength(2);
   });
 
@@ -350,9 +353,9 @@ describe("critical の Discord 重複抑制", () => {
     });
     const { kv, store } = makeKV();
     const env = makeEnv({ DEDUP_KV: kv });
-    await run(processPayloads(env, [critical]));
+    await settle(processPayloads(env, [critical]));
     expect(store.size).toBe(0);
-    const [second] = await run(processPayloads(env, [critical]));
+    const [second] = await settle(processPayloads(env, [critical]));
     expect(discordCalls).toHaveLength(2);
     expect(second.discord).toEqual({ ok: true, status: 204 });
   });
@@ -368,7 +371,7 @@ describe("critical の Discord 重複抑制", () => {
       }),
       delete: vi.fn(async () => {}),
     } as unknown as KVNamespace;
-    const [res] = await run(processPayloads(makeEnv({ DEDUP_KV: failing }), [critical]));
+    const [res] = await settle(processPayloads(makeEnv({ DEDUP_KV: failing }), [critical]));
     expect(discordCalls).toHaveLength(1);
     expect(notionCalls).toHaveLength(1);
     expect(res.success).toBe(true);
@@ -376,7 +379,7 @@ describe("critical の Discord 重複抑制", () => {
 
   it("Discord への payload は allowed_mentions で everyone (@here) だけ許す", async () => {
     const { discordCalls } = stubFetch();
-    await run(processPayloads(makeEnv(), [critical]));
+    await settle(processPayloads(makeEnv(), [critical]));
     expect(discordCalls[0].json.allowed_mentions).toEqual({ parse: ["everyone"] });
     expect(discordCalls[0].json.content).toBe("@here");
   });
@@ -384,29 +387,28 @@ describe("critical の Discord 重複抑制", () => {
 
 describe("consumeRetryBatch (Queue consumer)", () => {
   const message = (subject: string) => ({
-    notionBody: {
-      parent: { database_id: OBS_DB_ID },
-      properties: { subject: { title: [{ text: { content: subject } }] } },
-    },
+    properties: { subject: { title: [{ text: { content: subject } }] } },
     subject,
   });
 
-  it("観測性 DB 以外を指すメッセージは Notion を呼ばず ack", async () => {
+  it("書き込み先は consumer が観測性 DB に固定する (メッセージに parent を持たせても使わない)", async () => {
     const { notionCalls } = stubFetch();
-    const other = message("x");
     const { batch, messages } = makeBatch([
-      { ...other, notionBody: { ...other.notionBody, parent: { database_id: "other-db" } } },
-      { ...other, notionBody: { ...other.notionBody, parent: { page_id: OBS_DB_ID } } },
+      { ...message("x"), parent: { database_id: "other-db" } },
     ]);
-    await run(consumeRetryBatch(batch, makeEnv()));
-    expect(notionCalls).toHaveLength(0);
-    expect(messages.every((m) => m.ack.mock.calls.length === 1)).toBe(true);
+    await settle(consumeRetryBatch(batch, makeEnv()));
+    expect(notionCalls).toHaveLength(1);
+    expect(notionCalls[0].json).toEqual({
+      parent: { database_id: OBS_DB_ID },
+      properties: message("x").properties,
+    });
+    expect(messages[0].ack).toHaveBeenCalledTimes(1);
   });
 
   it("書けたら ack。Notion 呼び出しは 350ms 以上空ける", async () => {
     const { notionCalls } = stubFetch();
     const { batch, messages } = makeBatch([message("a"), message("b")]);
-    await run(consumeRetryBatch(batch, makeEnv()));
+    await settle(consumeRetryBatch(batch, makeEnv()));
     expect(messages.every((m) => m.ack.mock.calls.length === 1)).toBe(true);
     expect(messages.every((m) => m.retry.mock.calls.length === 0)).toBe(true);
     expect(notionCalls.map((c) => subjectOf(c.json))).toEqual(["a", "b"]);
@@ -416,7 +418,7 @@ describe("consumeRetryBatch (Queue consumer)", () => {
   it("5xx は 30 秒後に retry (1 メッセージにつき Notion は 1 回だけ)", async () => {
     const { notionCalls } = stubFetch({ notion: () => notionError(503) });
     const { batch, messages } = makeBatch([message("a")]);
-    await run(consumeRetryBatch(batch, makeEnv()));
+    await settle(consumeRetryBatch(batch, makeEnv()));
     expect(notionCalls).toHaveLength(1);
     expect(messages[0].retry).toHaveBeenCalledWith({ delaySeconds: 30 });
     expect(messages[0].ack).not.toHaveBeenCalled();
@@ -425,14 +427,27 @@ describe("consumeRetryBatch (Queue consumer)", () => {
   it("429 + Retry-After: 120 は 120 秒後に retry", async () => {
     stubFetch({ notion: () => notionError(429, { "Retry-After": "120" }) });
     const { batch, messages } = makeBatch([message("a")]);
-    await run(consumeRetryBatch(batch, makeEnv()));
+    await settle(consumeRetryBatch(batch, makeEnv()));
     expect(messages[0].retry).toHaveBeenCalledWith({ delaySeconds: 120 });
   });
 
-  it("max_retries (5) を使い切った配信でも失敗 → ack して諦める", async () => {
+  it("QUEUE_MAX_RETRIES (5) 回再送しても失敗 → ack して諦める (5 回目までは retry)", async () => {
     stubFetch({ notion: () => notionError(500) });
+    const fifth = makeBatch([message("a")], 5);
+    await settle(consumeRetryBatch(fifth.batch, makeEnv()));
+    expect(fifth.messages[0].retry).toHaveBeenCalledWith({ delaySeconds: 30 });
+    expect(fifth.messages[0].ack).not.toHaveBeenCalled();
+
+    const sixth = makeBatch([message("a")], 6);
+    await settle(consumeRetryBatch(sixth.batch, makeEnv()));
+    expect(sixth.messages[0].ack).toHaveBeenCalledTimes(1);
+    expect(sixth.messages[0].retry).not.toHaveBeenCalled();
+  });
+
+  it("NOTION_TOKEN 未設定のまま再送回数を使い切ったら ack して諦める", async () => {
+    stubFetch();
     const { batch, messages } = makeBatch([message("a")], 6);
-    await run(consumeRetryBatch(batch, makeEnv()));
+    await settle(consumeRetryBatch(batch, makeEnv({ NOTION_TOKEN: undefined })));
     expect(messages[0].ack).toHaveBeenCalledTimes(1);
     expect(messages[0].retry).not.toHaveBeenCalled();
   });
@@ -442,7 +457,7 @@ describe("consumeRetryBatch (Queue consumer)", () => {
       notion: () => Response.json({ object: "error", code: "validation_error" }, { status: 400 }),
     });
     const { batch, messages } = makeBatch([message("a")]);
-    await run(consumeRetryBatch(batch, makeEnv()));
+    await settle(consumeRetryBatch(batch, makeEnv()));
     expect(messages[0].ack).toHaveBeenCalledTimes(1);
     expect(messages[0].retry).not.toHaveBeenCalled();
   });
@@ -450,7 +465,7 @@ describe("consumeRetryBatch (Queue consumer)", () => {
   it("形の壊れたメッセージは Notion を呼ばず ack", async () => {
     const { notionCalls } = stubFetch();
     const { batch, messages } = makeBatch([null, { subject: "x" }]);
-    await run(consumeRetryBatch(batch, makeEnv()));
+    await settle(consumeRetryBatch(batch, makeEnv()));
     expect(notionCalls).toHaveLength(0);
     expect(messages.every((m) => m.ack.mock.calls.length === 1)).toBe(true);
   });
@@ -458,7 +473,7 @@ describe("consumeRetryBatch (Queue consumer)", () => {
   it("NOTION_TOKEN 未設定なら retry (設定後に書ける)", async () => {
     const { notionCalls } = stubFetch();
     const { batch, messages } = makeBatch([message("a")]);
-    await run(consumeRetryBatch(batch, makeEnv({ NOTION_TOKEN: undefined })));
+    await settle(consumeRetryBatch(batch, makeEnv({ NOTION_TOKEN: undefined })));
     expect(notionCalls).toHaveLength(0);
     expect(messages[0].retry).toHaveBeenCalledWith({ delaySeconds: 30 });
   });

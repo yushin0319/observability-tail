@@ -3,6 +3,7 @@
  * n8n-server の code-nodes/api-obs-from-grafana/ConvertGrafana.ts を純関数にしたもの。
  */
 import type { ObsNotifyPayload } from "../obsNotifyPayload";
+import { HOST_TO_REPO, HTTP_URL } from "../shared";
 import type { JsonObject } from "../types";
 
 const LABEL_TO_SEVERITY: Record<string, "critical" | "warning" | "info"> = {
@@ -12,14 +13,6 @@ const LABEL_TO_SEVERITY: Record<string, "critical" | "warning" | "info"> = {
   warn: "warning",
   info: "info",
 };
-
-const HOST_TO_REPO: Record<string, string> = {
-  "n8n-server": "n8n-server",
-  "crypto-ai-trader": "crypto-ai-trader",
-  "crypto-ai-trader-runner": "crypto-ai-trader",
-};
-
-const HTTP_URL = /^https?:\/\//;
 
 type Alert = {
   status?: string;
@@ -87,21 +80,18 @@ function convertOne(alert: Alert, rootStatus: string): ObsNotifyPayload {
 export const GRAFANA_MAX_ALERTS = 50;
 
 /**
- * alerts[] を先頭 max 件に切り詰める (変換前に切って CPU 時間を抑える)。
+ * alerts[] を先頭 GRAFANA_MAX_ALERTS 件に切り詰める (変換前に切って CPU 時間を抑える)。
  * alerts[] が無い payload はそのまま返す (convertGrafana が unknown payload として記録する)。
  */
-export function capGrafanaAlerts(
-  input: unknown,
-  max = GRAFANA_MAX_ALERTS,
-): { body: unknown; dropped: number } {
+export function capGrafanaAlerts(input: unknown): { body: unknown; dropped: number } {
   const body = (input as JsonObject) || ({} as JsonObject);
   const alerts = body.alerts;
-  if (!Array.isArray(alerts) || alerts.length <= max) {
+  if (!Array.isArray(alerts) || alerts.length <= GRAFANA_MAX_ALERTS) {
     return { body: input, dropped: 0 };
   }
   return {
-    body: { ...body, alerts: alerts.slice(0, max) },
-    dropped: alerts.length - max,
+    body: { ...body, alerts: alerts.slice(0, GRAFANA_MAX_ALERTS) },
+    dropped: alerts.length - GRAFANA_MAX_ALERTS,
   };
 }
 

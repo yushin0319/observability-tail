@@ -9,6 +9,7 @@ import {
   fetchWithTimeout,
   sleep,
 } from "./budget";
+import { errorMessage } from "./shared";
 import type { JsonObject } from "./types";
 
 export const NOTION_PAGES_URL = "https://api.notion.com/v1/pages";
@@ -34,6 +35,11 @@ export interface NotionAttempt {
 export interface NotionWriteResult extends NotionAttempt {
   /** 実際に Notion を呼んだ回数 */
   attempts: number;
+}
+
+/** Notion を呼ばなかったときの結果 (設定漏れ・上限超過・Notion 停止中) */
+export function notAttempted(message: string, retryable: boolean): NotionWriteResult {
+  return { ok: false, status: null, message, retryable, attempts: 0 };
 }
 
 /** Retry-After (秒数 or HTTP-date) を秒に直す。解釈できなければ undefined */
@@ -69,7 +75,7 @@ export async function createNotionPage(
     return {
       ok: false,
       status: null,
-      message: e instanceof Error ? e.message : String(e),
+      message: errorMessage(e),
       retryable: true,
     };
   }
@@ -109,12 +115,10 @@ export async function writeNotionWithRetry(
   budget: InvocationBudget,
 ): Promise<NotionWriteResult> {
   let attempts = 0;
-  let last: NotionAttempt = {
-    ok: false,
-    status: null,
-    message: "notion call budget exhausted",
-    retryable: true,
-  };
+  let last: NotionAttempt = notAttempted(
+    "not attempted (notion budget / deadline exhausted or Notion down)",
+    true,
+  );
 
   while (attempts < NOTION_MAX_ATTEMPTS) {
     if (attempts > 0) {

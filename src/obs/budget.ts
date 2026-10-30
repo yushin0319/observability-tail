@@ -23,67 +23,62 @@ export const HTTP_TIMEOUT_MS = 10_000;
 /** fetch / tail 経路で処理全体にかけてよい時間 */
 export const PROCESS_BUDGET_MS = 20_000;
 
+export type BudgetKind = "write" | "notion" | "discord" | "queue";
+
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export interface BudgetOptions {
-  /** 処理全体にかけてよい時間 (既定 PROCESS_BUDGET_MS) */
-  budgetMs?: number;
-}
-
 export class InvocationBudget {
-  writesLeft = MAX_DIRECT_WRITES;
-  notionCallsLeft = MAX_NOTION_CALLS;
-  discordCallsLeft = MAX_DISCORD_CALLS;
-  queueCallsLeft = MAX_QUEUE_CALLS;
-  /** 再試行を使い切った書き込みがあった = Notion が落ちている。以降は試さず Queue に回す */
-  notionDown = false;
   readonly deadline: number;
+  private readonly left: Record<BudgetKind, number> = {
+    write: MAX_DIRECT_WRITES,
+    notion: MAX_NOTION_CALLS,
+    discord: MAX_DISCORD_CALLS,
+    queue: MAX_QUEUE_CALLS,
+  };
+  /** 再試行を使い切った書き込みがあった = Notion が落ちている。以降は呼ばずに Queue に回す */
+  private notionDown = false;
   private nextNotionAt = 0;
 
-  constructor(opts: BudgetOptions = {}) {
-    this.deadline = Date.now() + (opts.budgetMs ?? PROCESS_BUDGET_MS);
+  constructor(budgetMs = PROCESS_BUDGET_MS) {
+    this.deadline = Date.now() + budgetMs;
   }
 
-  /** waitMs 待ってから Notion を 1 回呼んでも締め切りに間に合うか */
+  /** waitMs 待ってから HTTP を 1 回呼んでも締め切りに間に合うか */
   hasTimeFor(waitMs: number): boolean {
     return Date.now() + waitMs + HTTP_TIMEOUT_MS <= this.deadline;
   }
 
   /**
+   * kind の枠を 1 つ取る。尽きていれば false。
+   * Discord は応答を締め切りまでに待ち切れないときも false。
+   */
+  take(kind: BudgetKind): boolean {
+    if (this.left[kind] <= 0) return false;
+    if (kind === "discord" && !this.hasTimeFor(0)) return false;
+    this.left[kind]--;
+    return true;
+  }
+
+  /** Notion の再試行を使い切った。この invocation では以降 Notion を呼ばない */
+  reportNotionFailure(): void {
+    this.notionDown = true;
+  }
+
+  /**
    * Notion 呼び出し 1 回分の枠を取り、前回の呼び出しから 350ms 空くまで待つ。
-   * 枠が尽きた / 締め切りに間に合わないときは false (呼び出さずに Queue に回す)。
-   * 並行して呼ばれても (tail 経路) 開始時刻を同期的に予約するので間隔は保たれる。
+   * Notion 停止中・枠が尽きた・締め切りに間に合わないときは false (呼び出さずに Queue に回す)。
+   * 並行して呼ばれても開始時刻を同期的に予約するので間隔は保たれる。
    */
   async acquireNotionCall(): Promise<boolean> {
-    if (this.notionCallsLeft <= 0) return false;
+    if (this.notionDown) return false;
     const now = Date.now();
     const startAt = Math.max(now, this.nextNotionAt);
     if (startAt + HTTP_TIMEOUT_MS > this.deadline) return false;
-    this.notionCallsLeft--;
+    if (!this.take("notion")) return false;
     this.nextNotionAt = startAt + NOTION_GAP_MS;
     if (startAt > now) await sleep(startAt - now);
-    return true;
-  }
-
-  /** 直接書き込みの枠を 1 件取る */
-  takeWrite(): boolean {
-    if (this.writesLeft <= 0) return false;
-    this.writesLeft--;
-    return true;
-  }
-
-  /** Discord 呼び出し 1 回分の枠を取る。締め切りまでに応答を待ち切れないときも false */
-  takeDiscordCall(): boolean {
-    if (this.discordCallsLeft <= 0 || !this.hasTimeFor(0)) return false;
-    this.discordCallsLeft--;
-    return true;
-  }
-
-  takeQueueCall(): boolean {
-    if (this.queueCallsLeft <= 0) return false;
-    this.queueCallsLeft--;
     return true;
   }
 }

@@ -1,10 +1,11 @@
 /**
- * テスト用の外部依存の偽物 (fetch と Queue だけ)。本番コードからは import しない。
+ * テスト用の外部依存の偽物 (fetch・KV・Queue・ExecutionContext) と時計の操作。
+ * 本番コードからは import しない。
  */
 import { vi } from "vitest";
+import { NOTION_PAGES_URL } from "./notion";
 import type { JsonObject, ObsRetryMessage } from "./types";
 
-export const NOTION_URL = "https://api.notion.com/v1/pages";
 export const DISCORD_URL = "https://discord.example/api/webhooks/1/critical";
 
 export interface RecordedCall {
@@ -19,12 +20,11 @@ type Responder = (call: RecordedCall, nth: number) => Response | Promise<Respons
 
 /**
  * fetch の偽物。Notion / Discord それぞれ n 回目の呼び出しに返す応答を関数で決める。
- * 既定は Notion = ページ作成成功、Discord = 204。
+ * 既定は Notion = ページ作成成功、Discord = 204。それ以外の URL は 599。
  */
 export function stubFetch(opts: { notion?: Responder; discord?: Responder } = {}) {
   const notionCalls: RecordedCall[] = [];
   const discordCalls: RecordedCall[] = [];
-  const otherCalls: RecordedCall[] = [];
   const notion: Responder = opts.notion ?? ((_c, n) => notionPage(`page-${n}`));
   const discord: Responder = opts.discord ?? (() => new Response(null, { status: 204 }));
 
@@ -37,7 +37,7 @@ export function stubFetch(opts: { notion?: Responder; discord?: Responder } = {}
       at: Date.now(),
       json: body ? (JSON.parse(body) as JsonObject) : {},
     };
-    if (url === NOTION_URL) {
+    if (url === NOTION_PAGES_URL) {
       notionCalls.push(call);
       return notion(call, notionCalls.length);
     }
@@ -45,11 +45,10 @@ export function stubFetch(opts: { notion?: Responder; discord?: Responder } = {}
       discordCalls.push(call);
       return discord(call, discordCalls.length);
     }
-    otherCalls.push(call);
     return new Response("unexpected", { status: 599 });
   });
   vi.stubGlobal("fetch", fetchMock);
-  return { fetchMock, notionCalls, discordCalls, otherCalls };
+  return { fetchMock, notionCalls, discordCalls };
 }
 
 export function notionPage(id: string): Response {
@@ -63,56 +62,58 @@ export function notionError(status: number, headers: Record<string, string> = {}
   );
 }
 
-/** KV namespace の偽物 (get / put / delete と TTL の記録だけ) */
+/** KV namespace の偽物 (get / put / delete / list と TTL の記録) */
 export function makeKV() {
   const store = new Map<string, { value: string; ttl?: number }>();
   const kv = {
-    get: vi.fn(async (key: string) => store.get(key)?.value ?? null),
-    put: vi.fn(async (key: string, value: string, opts?: { expirationTtl?: number }) => {
+    get: async (key: string) => store.get(key)?.value ?? null,
+    put: async (key: string, value: string, opts?: { expirationTtl?: number }) => {
       store.set(key, { value, ttl: opts?.expirationTtl });
-    }),
-    delete: vi.fn(async (key: string) => {
+    },
+    delete: async (key: string) => {
       store.delete(key);
+    },
+    list: async (opts?: { prefix?: string }) => ({
+      keys: [...store.keys()]
+        .filter((k) => k.startsWith(opts?.prefix ?? ""))
+        .map((name) => ({ name })),
+      list_complete: true,
     }),
   };
-  return { kv: kv as unknown as KVNamespace, store, raw: kv };
+  return { kv: kv as unknown as KVNamespace, store };
 }
 
-/** Queue binding の偽物 */
+/** Queue binding の偽物 (sendBatch だけ) */
 export function makeQueue() {
   const sent: MessageSendRequest<ObsRetryMessage>[] = [];
-  const queue = {
-    sendBatch: vi.fn(async (msgs: Iterable<MessageSendRequest<ObsRetryMessage>>) => {
-      sent.push(...msgs);
-      return { metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } };
-    }),
-    send: vi.fn(async (body: ObsRetryMessage, options?: QueueSendOptions) => {
-      sent.push({ body, delaySeconds: options?.delaySeconds });
-      return { metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } } };
-    }),
-    metrics: vi.fn(async () => ({ backlogCount: 0, backlogBytes: 0 })),
-  };
-  return { queue: queue as unknown as Queue<ObsRetryMessage>, sent, raw: queue };
+  const sendBatch = vi.fn(async (msgs: Iterable<MessageSendRequest<ObsRetryMessage>>) => {
+    sent.push(...msgs);
+  });
+  return { queue: { sendBatch } as unknown as Queue<ObsRetryMessage>, sent, sendBatch };
 }
 
 /** Queue consumer に渡す MessageBatch の偽物 */
 export function makeBatch(bodies: unknown[], attempts = 1) {
   const messages = bodies.map((body, i) => ({
     id: `msg-${i}`,
-    timestamp: new Date(),
     body,
     attempts,
     ack: vi.fn(),
     retry: vi.fn(),
   }));
-  const batch = {
-    queue: "obs-notify-retry",
-    messages,
-    metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } },
-    ackAll: vi.fn(),
-    retryAll: vi.fn(),
-  };
-  return { batch: batch as unknown as MessageBatch<unknown>, messages };
+  return { batch: { messages } as unknown as MessageBatch<unknown>, messages };
+}
+
+/** ExecutionContext の偽物。waitUntil に渡された Promise を集める */
+export function makeCtx() {
+  const promises: Promise<unknown>[] = [];
+  return {
+    promises,
+    waitUntil: (p: Promise<unknown>) => {
+      promises.push(p);
+    },
+    passThroughOnException: () => {},
+  } as unknown as ExecutionContext & { promises: Promise<unknown>[] };
 }
 
 /** テストは Node で動くので setImmediate がある (Workers の型定義には無い) */
@@ -151,8 +152,8 @@ export async function settle<T>(p: Promise<T>): Promise<T> {
   return p;
 }
 
-/** Notion に送った本文から subject を取り出す */
-export function subjectOf(notionBody: JsonObject): string {
-  const props = notionBody.properties as Record<string, any>;
+/** Notion に送った本文 (または再送メッセージ) から subject を取り出す */
+export function subjectOf(withProperties: { properties?: unknown }): string {
+  const props = withProperties.properties as Record<string, any>;
   return props.subject.title[0].text.content as string;
 }

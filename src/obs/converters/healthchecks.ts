@@ -4,6 +4,7 @@
  */
 import type { ObsNotifyPayload } from "../obsNotifyPayload";
 import { ObsPayloadError } from "../prepNotify";
+import { HTTP_URL } from "../shared";
 import type { JsonObject } from "../types";
 
 export function convertHealthchecks(input: unknown): ObsNotifyPayload[] {
@@ -30,7 +31,7 @@ export function convertHealthchecks(input: unknown): ObsNotifyPayload[] {
   };
   // HC.io の Webhook body template で `$URL` を含めても、check 自身に URL 未設定だと
   // placeholder が展開されず文字列 "$URL" がそのまま送られてくる。non-http(s) は弾く。
-  if (url && /^https?:\/\//.test(url)) out.url = url;
+  if (url && HTTP_URL.test(url)) out.url = url;
 
   return [out];
 }
