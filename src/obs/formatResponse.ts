@@ -19,6 +19,8 @@ export interface DiscordStatus {
   ok: boolean;
   status: number | null;
   skipped?: true;
+  /** 60 秒以内に同じ critical を送っていたので鳴らさなかったとき true */
+  deduplicated?: true;
 }
 
 export interface NotionStatus {

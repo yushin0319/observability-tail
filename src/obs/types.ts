@@ -16,12 +16,16 @@ export interface ObsRetryMessage {
 export interface ObsEnv {
   /** POST /obs-notify の X-Webhook-Secret と照合する */
   WEBHOOK_SECRET?: string;
-  /** POST /obs-from/* の X-Adapter-Token またはパス末尾と照合する */
+  /** POST /obs-from/{healthchecks|grafana|netdata} の X-Adapter-Token と照合する */
   ADAPTER_TOKEN?: string;
+  /** POST /obs-from/sentry のパス末尾または X-Adapter-Token と照合する (Sentry 専用) */
+  SENTRY_ADAPTER_TOKEN?: string;
   /** Notion integration token (観測性 DB への書き込み権限) */
   NOTION_TOKEN?: string;
   /** critical を即時に送る Discord webhook URL */
   DISCORD_CRITICAL_URL?: string;
   /** Notion 書き込みに失敗したイベントの再送キュー (未作成なら undefined) */
   OBS_RETRY_QUEUE?: Queue<ObsRetryMessage>;
+  /** 同じ critical を 60 秒以内に Discord へ 2 度送らないための記録 (tail の重複抑制と共用) */
+  DEDUP_KV?: KVNamespace;
 }

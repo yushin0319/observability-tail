@@ -153,6 +153,30 @@ describe("prepNotify", () => {
     expect(props.url).toBeUndefined();
   });
 
+  it("url が 2000 字を超えたら Discord/Notion 共に omit (2000 字ちょうどは通す)", () => {
+    const base = "https://example.com/";
+    const ok = base + "a".repeat(2000 - base.length);
+    const tooLong = `${ok}b`;
+    const kept = prepNotify({ ...minimalBody, url: ok });
+    expect((kept.notionBody.properties as Record<string, any>).url.url).toBe(ok);
+    const dropped = prepNotify({ ...minimalBody, url: tooLong });
+    expect((dropped.discordBody as Record<string, any>).embeds[0].url).toBeUndefined();
+    expect((dropped.notionBody.properties as Record<string, any>).url).toBeUndefined();
+  });
+
+  it("url が文字列でなければ omit (配列・オブジェクトを文字列扱いしない)", () => {
+    for (const url of [["https://example.com/a"], { href: "https://example.com" }, 42]) {
+      const out = prepNotify({ ...minimalBody, url });
+      expect((out.discordBody as Record<string, any>).embeds[0].url).toBeUndefined();
+      expect((out.notionBody.properties as Record<string, any>).url).toBeUndefined();
+    }
+  });
+
+  it("Discord payload は allowed_mentions で everyone (@here) だけ許す", () => {
+    const out = prepNotify({ ...minimalBody, severity: "critical" });
+    expect(out.discordBody.allowed_mentions).toEqual({ parse: ["everyone"] });
+  });
+
   it("repo が許可リスト外で throw", () => {
     expect(() => prepNotify({ ...minimalBody, repo: "unknown-repo" })).toThrow(
       "repo must be one of",

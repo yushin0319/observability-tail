@@ -17,6 +17,7 @@
  *   観測性イベントを受け付ける (src/obs/routes.ts)。Notion に書けなかった分は
  *   OBS_RETRY_QUEUE に積み、queue ハンドラが後から書き込む。
  */
+import { matchesSecret } from "./obs/auth";
 import { InvocationBudget } from "./obs/budget";
 import { consumeRetryBatch, processPayloads } from "./obs/process";
 import { routeObsRequest } from "./obs/routes";
@@ -252,7 +253,8 @@ async function handleGetErrors(
     return new Response("READ_TOKEN not configured", { status: 503 });
   }
   const auth = request.headers.get("Authorization") ?? "";
-  if (!auth.startsWith("Bearer ") || auth.slice(7).trim() !== env.READ_TOKEN) {
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+  if (!(await matchesSecret([token], env.READ_TOKEN))) {
     return new Response("unauthorized", { status: 401 });
   }
 

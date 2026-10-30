@@ -63,6 +63,21 @@ export function notionError(status: number, headers: Record<string, string> = {}
   );
 }
 
+/** KV namespace の偽物 (get / put / delete と TTL の記録だけ) */
+export function makeKV() {
+  const store = new Map<string, { value: string; ttl?: number }>();
+  const kv = {
+    get: vi.fn(async (key: string) => store.get(key)?.value ?? null),
+    put: vi.fn(async (key: string, value: string, opts?: { expirationTtl?: number }) => {
+      store.set(key, { value, ttl: opts?.expirationTtl });
+    }),
+    delete: vi.fn(async (key: string) => {
+      store.delete(key);
+    }),
+  };
+  return { kv: kv as unknown as KVNamespace, store, raw: kv };
+}
+
 /** Queue binding の偽物 */
 export function makeQueue() {
   const sent: MessageSendRequest<ObsRetryMessage>[] = [];

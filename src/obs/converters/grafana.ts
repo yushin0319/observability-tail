@@ -83,6 +83,28 @@ function convertOne(alert: Alert, rootStatus: string): ObsNotifyPayload {
   return out;
 }
 
+/** 1 リクエストで扱う Grafana アラートの上限 */
+export const GRAFANA_MAX_ALERTS = 50;
+
+/**
+ * alerts[] を先頭 max 件に切り詰める (変換前に切って CPU 時間を抑える)。
+ * alerts[] が無い payload はそのまま返す (convertGrafana が unknown payload として記録する)。
+ */
+export function capGrafanaAlerts(
+  input: unknown,
+  max = GRAFANA_MAX_ALERTS,
+): { body: unknown; dropped: number } {
+  const body = (input as JsonObject) || ({} as JsonObject);
+  const alerts = body.alerts;
+  if (!Array.isArray(alerts) || alerts.length <= max) {
+    return { body: input, dropped: 0 };
+  }
+  return {
+    body: { ...body, alerts: alerts.slice(0, max) },
+    dropped: alerts.length - max,
+  };
+}
+
 export function convertGrafana(input: unknown): ObsNotifyPayload[] {
   const body = (input as JsonObject) || ({} as JsonObject);
   const alerts = (body.alerts as Alert[] | undefined) || [];

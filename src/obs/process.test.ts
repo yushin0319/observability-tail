@@ -5,11 +5,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InvocationBudget } from "./budget";
 import { convertGrafana } from "./converters/grafana";
-import { ObsPayloadError } from "./prepNotify";
+import { OBS_DB_ID, ObsPayloadError } from "./prepNotify";
 import { consumeRetryBatch, processPayloads } from "./process";
 import {
   DISCORD_URL,
   makeBatch,
+  makeKV,
   makeQueue,
   notionError,
   notionPage,
@@ -307,13 +308,99 @@ describe("processPayloads", () => {
   });
 });
 
+describe("critical の Discord 重複抑制", () => {
+  it("60 秒以内の同じ critical は Discord を鳴らさず Notion にだけ記録する", async () => {
+    const { discordCalls, notionCalls } = stubFetch();
+    const { kv, store } = makeKV();
+    const env = makeEnv({ DEDUP_KV: kv });
+
+    const [first] = await run(processPayloads(env, [critical]));
+    const [second] = await run(processPayloads(env, [critical]));
+
+    expect(discordCalls).toHaveLength(1);
+    expect(notionCalls).toHaveLength(2);
+    const [entry] = Array.from(store.values());
+    expect(store.size).toBe(1);
+    expect(entry.ttl).toBe(60);
+
+    expect(first.discord).toEqual({ ok: true, status: 204 });
+    expect(second.discord).toEqual({
+      ok: true,
+      status: null,
+      skipped: true,
+      deduplicated: true,
+    });
+    expect(second.success).toBe(true);
+    // 2 回目は Discord に送っていないので送信先は記録しない
+    const props = notionCalls[1].json.properties as Record<string, any>;
+    expect(props.discord_channel).toBeUndefined();
+  });
+
+  it("subject が違えば別のアラートとして送る", async () => {
+    const { discordCalls } = stubFetch();
+    const env = makeEnv({ DEDUP_KV: makeKV().kv });
+    await run(processPayloads(env, [critical]));
+    await run(processPayloads(env, [{ ...critical, subject: "🚨 別件" }]));
+    expect(discordCalls).toHaveLength(2);
+  });
+
+  it("Discord に送れなかったら印を消し、次の同じアラートで送り直す", async () => {
+    const { discordCalls } = stubFetch({
+      discord: (_c, n) => new Response(null, { status: n === 1 ? 500 : 204 }),
+    });
+    const { kv, store } = makeKV();
+    const env = makeEnv({ DEDUP_KV: kv });
+    await run(processPayloads(env, [critical]));
+    expect(store.size).toBe(0);
+    const [second] = await run(processPayloads(env, [critical]));
+    expect(discordCalls).toHaveLength(2);
+    expect(second.discord).toEqual({ ok: true, status: 204 });
+  });
+
+  it("KV が失敗しても critical は Discord に送る", async () => {
+    const { discordCalls, notionCalls } = stubFetch();
+    const failing = {
+      get: vi.fn(async () => {
+        throw new Error("KV unavailable");
+      }),
+      put: vi.fn(async () => {
+        throw new Error("KV unavailable");
+      }),
+      delete: vi.fn(async () => {}),
+    } as unknown as KVNamespace;
+    const [res] = await run(processPayloads(makeEnv({ DEDUP_KV: failing }), [critical]));
+    expect(discordCalls).toHaveLength(1);
+    expect(notionCalls).toHaveLength(1);
+    expect(res.success).toBe(true);
+  });
+
+  it("Discord への payload は allowed_mentions で everyone (@here) だけ許す", async () => {
+    const { discordCalls } = stubFetch();
+    await run(processPayloads(makeEnv(), [critical]));
+    expect(discordCalls[0].json.allowed_mentions).toEqual({ parse: ["everyone"] });
+    expect(discordCalls[0].json.content).toBe("@here");
+  });
+});
+
 describe("consumeRetryBatch (Queue consumer)", () => {
   const message = (subject: string) => ({
     notionBody: {
-      parent: { database_id: "db" },
+      parent: { database_id: OBS_DB_ID },
       properties: { subject: { title: [{ text: { content: subject } }] } },
     },
     subject,
+  });
+
+  it("観測性 DB 以外を指すメッセージは Notion を呼ばず ack", async () => {
+    const { notionCalls } = stubFetch();
+    const other = message("x");
+    const { batch, messages } = makeBatch([
+      { ...other, notionBody: { ...other.notionBody, parent: { database_id: "other-db" } } },
+      { ...other, notionBody: { ...other.notionBody, parent: { page_id: OBS_DB_ID } } },
+    ]);
+    await run(consumeRetryBatch(batch, makeEnv()));
+    expect(notionCalls).toHaveLength(0);
+    expect(messages.every((m) => m.ack.mock.calls.length === 1)).toBe(true);
   });
 
   it("書けたら ack。Notion 呼び出しは 350ms 以上空ける", async () => {

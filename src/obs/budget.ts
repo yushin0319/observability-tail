@@ -2,7 +2,8 @@
  * 1 回の Worker 呼び出し (invocation) で使える外部呼び出しの枠と時間。
  *
  * Workers Free の制約に収めるための上限:
- * - subrequest は 1 invocation 50 まで → Notion 20 + Discord 10 + Queue 5 = 最大 35
+ * - 外部への subrequest は 1 invocation 50 まで → Notion 20 + Discord 10 = 最大 30
+ *   (KV・Queue は Cloudflare 内部サービスの枠 1,000 で別勘定。Queue の sendBatch は最大 5 回)
  * - クライアント切断後に waitUntil で延長できるのは 30 秒まで → 処理全体を 20 秒以内に終える
  * Notion の平均レート制限 (3 req/s) に合わせ、Notion 呼び出しの開始間隔を 350ms 以上空ける。
  */

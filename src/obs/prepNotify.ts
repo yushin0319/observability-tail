@@ -9,6 +9,8 @@ export const OBS_DB_ID = "3552570f-e49f-80a6-9186-c1a14b7d9547";
 const NOTION_TEXT_LIMIT = 2000;
 const DISCORD_TITLE_LIMIT = 256;
 const DISCORD_DESC_LIMIT = 4096;
+/** Notion の url プロパティの上限に合わせる。これより長い url は捨てる */
+const URL_MAX_LENGTH = 2000;
 
 const COLOR_MAP: Record<string, number> = {
   critical: 0xe74c3c,
@@ -107,9 +109,15 @@ export function prepNotify(
   const sendDiscordNow = severity === "critical" && discordUrl !== "";
 
   const summary = (body.summary as string) || "";
-  const rawUrl = (body.url as string) || "";
-  // adapter 側のガード漏れに備えた二重保険: 非 http(s) URL は Discord/Notion 共に弾く。
-  const url = /^https?:\/\//.test(rawUrl) ? rawUrl : "";
+  const rawUrl = body.url;
+  // adapter 側のガード漏れに備えた二重保険: 文字列でない・長すぎる・非 http(s) の URL は
+  // Discord/Notion 共に弾く。
+  const url =
+    typeof rawUrl === "string" &&
+    rawUrl.length <= URL_MAX_LENGTH &&
+    /^https?:\/\//.test(rawUrl)
+      ? rawUrl
+      : "";
   const rawPayload = body.raw_payload;
   const rawPayloadStr =
     typeof rawPayload === "string"
@@ -129,7 +137,11 @@ export function prepNotify(
   };
   if (url) discordEmbed.url = url;
 
-  const discordBody: JsonObject = { embeds: [discordEmbed] };
+  // 通知してよいのは @here (everyone 枠) だけ。本文に紛れたユーザー・ロールのメンションは鳴らさない
+  const discordBody: JsonObject = {
+    embeds: [discordEmbed],
+    allowed_mentions: { parse: ["everyone"] },
+  };
   if (severity === "critical") discordBody.content = "@here";
 
   const notionProps: JsonObject = {
