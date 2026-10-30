@@ -3,6 +3,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import worker from "./index";
+import { settle, useFakeClock } from "./obs/test-helpers";
 
 interface MockKV {
   store: Map<string, { value: string; ttl?: number }>;
@@ -70,17 +71,17 @@ function makeEnv(overrides: Record<string, unknown> = {}) {
   return {
     DEDUP_KV: makeKV() as unknown as KVNamespace,
     ERROR_LOG_KV: makeKV() as unknown as KVNamespace,
-    OBS_NOTIFY_URL: "https://yushin-n8n.duckdns.org/webhook/obs-notify",
+    NOTION_TOKEN: "notion-token",
     READ_TOKEN: "test-token-123",
     ...overrides,
   };
 }
 
 describe("observability-tail Worker tail handler", () => {
-  it("level=error のログ 1 件で obs-notify に POST + KV 永続化する", async () => {
+  it("level=error のログ 1 件で 観測性 DB (Notion) に記録 + KV 永続化する", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
-        new Response("", { status: 204 }),
+        Response.json({ object: "page", id: "page-1" }),
     );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -111,10 +112,10 @@ describe("observability-tail Worker tail handler", () => {
     expect(entry.ttl).toBe(7 * 24 * 3600);
   });
 
-  it("info ログは obs-notify も KV 永続化もしない", async () => {
+  it("info ログは 観測性 DB への記録も KV 永続化もしない", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
-        new Response("", { status: 204 }),
+        Response.json({ object: "page", id: "page-1" }),
     );
     vi.stubGlobal("fetch", fetchMock);
     const env = makeEnv();
@@ -136,17 +137,17 @@ describe("observability-tail Worker tail handler", () => {
     ).toBe(0);
   });
 
-  it("60秒以内の同一メッセージは obs-notify skip だが KV には毎回保存", async () => {
+  it("60秒以内の同一メッセージは 観測性 DB への記録は skip だが KV には毎回保存", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
-        new Response("", { status: 204 }),
+        Response.json({ object: "page", id: "page-1" }),
     );
     vi.stubGlobal("fetch", fetchMock);
     const env = makeEnv();
 
     const ctx1 = makeCtx();
     await worker.tail!(
-      [makeEvent({ logs: [{ message: ["BOOM"], level: "error", timestamp: 1 }] })] as unknown as Parameters<NonNullable<typeof worker.tail>>[0],
+      [makeEvent({ eventTimestamp: 1_000, logs: [{ message: ["BOOM"], level: "error", timestamp: 1 }] })] as unknown as Parameters<NonNullable<typeof worker.tail>>[0],
       env,
       ctx1,
     );
@@ -154,13 +155,13 @@ describe("observability-tail Worker tail handler", () => {
 
     const ctx2 = makeCtx();
     await worker.tail!(
-      [makeEvent({ logs: [{ message: ["BOOM"], level: "error", timestamp: 2 }] })] as unknown as Parameters<NonNullable<typeof worker.tail>>[0],
+      [makeEvent({ eventTimestamp: 2_000, logs: [{ message: ["BOOM"], level: "error", timestamp: 2 }] })] as unknown as Parameters<NonNullable<typeof worker.tail>>[0],
       env,
       ctx2,
     );
     await Promise.all(ctx2.promises);
 
-    // obs-notify は 1 回（dedup）
+    // Notion への記録は 1 回（dedup）
     expect(fetchMock).toHaveBeenCalledTimes(1);
     // KV は 2 件（dedup なし、すべての error を履歴として残す）
     expect(
@@ -173,7 +174,7 @@ describe("observability-tail Worker tail handler", () => {
     // で吐く JSON を取りこぼさない（観測性プロジェクト 2026-05-04 の事故の本筋）
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
-        new Response("", { status: 204 }),
+        Response.json({ object: "page", id: "page-1" }),
     );
     vi.stubGlobal("fetch", fetchMock);
     const env = makeEnv();
@@ -211,7 +212,7 @@ describe("observability-tail Worker tail handler", () => {
     // 偽陽性チェック: 普通の構造化ログ (type:cron_started 等) で発火しないこと
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
-        new Response("", { status: 204 }),
+        Response.json({ object: "page", id: "page-1" }),
     );
     vi.stubGlobal("fetch", fetchMock);
     const env = makeEnv();
@@ -241,10 +242,10 @@ describe("observability-tail Worker tail handler", () => {
     ).toBe(0);
   });
 
-  it("exception 1 件でも obs-notify に POST + KV 永続化", async () => {
+  it("exception 1 件でも 観測性 DB に記録 + KV 永続化", async () => {
     const fetchMock = vi.fn(
       async (_url: string, _init: RequestInit) =>
-        new Response("", { status: 204 }),
+        Response.json({ object: "page", id: "page-1" }),
     );
     vi.stubGlobal("fetch", fetchMock);
     const env = makeEnv();
@@ -269,6 +270,104 @@ describe("observability-tail Worker tail handler", () => {
     const stored = JSON.parse(entry.value);
     expect(stored.kind).toBe("exception");
     expect(stored.message).toContain("TypeError");
+  });
+
+  it("通知は HTTP の obs-notify を経由せず、受付と同じ処理で Notion API に直接書く", async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init: RequestInit) =>
+        Response.json({ object: "page", id: "page-1" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const env = makeEnv();
+    const ctx = makeCtx();
+    await worker.tail!(
+      [
+        makeEvent({
+          exceptions: [
+            { name: "TypeError", message: "x is undefined", timestamp: Date.now() },
+          ],
+        }),
+      ] as unknown as Parameters<NonNullable<typeof worker.tail>>[0],
+      env,
+      ctx,
+    );
+    await Promise.all(ctx.promises);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://api.notion.com/v1/pages");
+    const headers = init.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer notion-token");
+    const props = JSON.parse(init.body as string).properties;
+    expect(props.subject.title[0].text.content).toBe("⚠ shirankedo exception");
+    expect(props.severity.select.name).toBe("warning");
+    expect(props.service.select.name).toBe("cf-worker");
+    expect(props.repo.select.name).toBe("shirankedo");
+    expect(props.summary.rich_text[0].text.content).toBe(
+      "TypeError: x is undefined",
+    );
+    expect(JSON.parse(props.raw_payload.rich_text[0].text.content)).toEqual({
+      scriptName: "shirankedo",
+      outcome: "exception",
+      kind: "exception",
+      message: "TypeError: x is undefined",
+    });
+  });
+
+  it("NOTION_TOKEN 未設定なら記録はしないが KV 保存は続ける", async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, _init: RequestInit) =>
+        Response.json({ object: "page", id: "page-1" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const env = makeEnv({ NOTION_TOKEN: undefined });
+    const ctx = makeCtx();
+    await worker.tail!(
+      [
+        makeEvent({
+          logs: [{ message: ["BOOM"], level: "error", timestamp: Date.now() }],
+        }),
+      ] as unknown as Parameters<NonNullable<typeof worker.tail>>[0],
+      env,
+      ctx,
+    );
+    await Promise.all(ctx.promises);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect((env.ERROR_LOG_KV as unknown as MockKV).store.size).toBe(1);
+  });
+
+  it("Notion が落ちていたら再試行のあと再送キューに積む", async () => {
+    useFakeClock();
+    try {
+      const fetchMock = vi.fn(
+        async (_url: string, _init: RequestInit) =>
+          new Response("bad gateway", { status: 502 }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const sent: unknown[] = [];
+      const queue = {
+        sendBatch: vi.fn(async (msgs: Iterable<unknown>) => {
+          sent.push(...msgs);
+        }),
+      };
+      const env = makeEnv({ OBS_RETRY_QUEUE: queue });
+      const ctx = makeCtx();
+      await worker.tail!(
+        [
+          makeEvent({
+            logs: [{ message: ["BOOM"], level: "error", timestamp: Date.now() }],
+          }),
+        ] as unknown as Parameters<NonNullable<typeof worker.tail>>[0],
+        env,
+        ctx,
+      );
+      await settle(Promise.all(ctx.promises));
+
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(sent).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

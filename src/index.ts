@@ -1,26 +1,30 @@
 /**
- * Cloudflare Tail Worker (M11) + Error History API (A5).
+ * Cloudflare Tail Worker (M11) + Error History API (A5) + 観測性イベント受付 (obs-notify).
  *
  * 別 Worker (shirankedo / swipe-persona-api / worldpulse-api) の tail event を
  * 受信し:
- * 1. level=error / exception を n8n obs-notify (#529) 経由で通知（severity=warning）
- *    → 振り分け先 Discord channel + Notion 観測性ログ DB は obs-notify WF が担当
+ * 1. level=error / exception を観測性イベント (severity=warning) として処理する
+ *    → src/obs/process.ts が Notion 観測性ログ DB に書き込む (HTTP を経由せず直接呼ぶ)
  * 2. ERROR_LOG_KV に 7 日 TTL で保存し、GET /errors で AI が query 可能（A5）
  *
  * - 通知元 Worker 側の wrangler 設定に `[[tail_consumers]]` を追加すると、
  *   その Worker のリクエストごとに `tail` ハンドラへ TraceItem が流れてくる。
- * - n8n の観測性統一エンドポイントは env.OBS_NOTIFY_URL（wrangler secret）で渡す。
  * - 重複通知を避けるため、エラーメッセージ先頭 200 文字の hash を 60 秒 TTL の
- *   DEDUP_KV に書き込み、KV ヒット中は obs-notify への POST をスキップ。
+ *   DEDUP_KV に書き込み、KV ヒット中は記録をスキップ。
  * - GET /errors?since=1h は ERROR_LOG_KV から該当期間の error を返す。
  *   READ_TOKEN（wrangler secret）の Bearer auth 必須。
+ * - POST /obs-notify・POST /obs-from/{sentry|healthchecks|grafana|netdata} で外部からの
+ *   観測性イベントを受け付ける (src/obs/routes.ts)。Notion に書けなかった分は
+ *   OBS_RETRY_QUEUE に積み、queue ハンドラが後から書き込む。
  */
+import { InvocationBudget } from "./obs/budget";
+import { consumeRetryBatch, processPayloads } from "./obs/process";
+import { routeObsRequest } from "./obs/routes";
+import type { ObsEnv } from "./obs/types";
 
-interface Env {
+interface Env extends ObsEnv {
   DEDUP_KV: KVNamespace;
   ERROR_LOG_KV: KVNamespace;
-  /** n8n の api/obs-notify エンドポイント (https://yushin-n8n.duckdns.org/webhook/obs-notify) */
-  OBS_NOTIFY_URL: string;
   READ_TOKEN?: string;
 }
 
@@ -62,18 +66,24 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
+    // この invocation 内の Notion / Discord 呼び出しは 1 つの枠を共有する (subrequest 上限対策)
+    const budget = new InvocationBudget();
     for (const event of events) {
       const errorItems = collectErrors(event);
       if (errorItems.length === 0) continue;
 
       for (const item of errorItems) {
         ctx.waitUntil(persistError(env, event, item));
-        ctx.waitUntil(maybeNotify(env, event, item));
+        ctx.waitUntil(maybeNotify(env, event, item, budget));
       }
     }
   },
 
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx?: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/errors") {
       return handleGetErrors(request, env, url);
@@ -81,7 +91,14 @@ export default {
     if (url.pathname === "/health") {
       return new Response("ok", { status: 200 });
     }
+    const obsResponse = await routeObsRequest(request, env, ctx, url.pathname);
+    if (obsResponse) return obsResponse;
     return new Response("not found", { status: 404 });
+  },
+
+  /** OBS_RETRY_QUEUE の consumer: Notion に書けなかった観測性イベントを再送する */
+  async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
+    await consumeRetryBatch(batch, env);
   },
 };
 
@@ -181,8 +198,9 @@ async function maybeNotify(
   env: Env,
   event: TailEvent,
   item: ErrorItem,
+  budget: InvocationBudget,
 ): Promise<void> {
-  if (!env.OBS_NOTIFY_URL) return;
+  if (!env.NOTION_TOKEN) return;
 
   const truncated = item.message.slice(0, MESSAGE_TRUNCATE);
   const hash = await sha256(truncated);
@@ -212,25 +230,13 @@ async function maybeNotify(
     },
   };
 
-  try {
-    const resp = await fetch(env.OBS_NOTIFY_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!resp.ok) {
-      console.log(
-        JSON.stringify({
-          type: "obs_notify_error",
-          status: resp.status,
-        }),
-      );
-    }
-  } catch (e) {
+  // 受付エンドポイントと同じ処理を直接呼ぶ (Notion 書き込み + 失敗時は再送キュー)
+  const [res] = await processPayloads(env, [payload], budget);
+  if (!res.notion.ok && !res.notion.queued) {
     console.log(
       JSON.stringify({
-        type: "obs_notify_exception",
-        error: e instanceof Error ? e.message : String(e),
+        type: "obs_notify_error",
+        error_code: res.notion.error_code,
       }),
     );
   }
